@@ -1,5 +1,9 @@
+import asyncio
 import io
 import os
+import threading
+import time
+import uuid
 import torch
 
 os.environ['VLLM_USE_V1'] = '0'
@@ -29,15 +33,18 @@ def _load_model_processor(args):
         else:
             model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(args.checkpoint_path, device_map="auto", dtype='auto')
     else:
-        from vllm import LLM
-        model = LLM(
-            model=args.checkpoint_path, trust_remote_code=True, gpu_memory_utilization=0.95,
+        from vllm import AsyncLLMEngine, AsyncEngineArgs
+        engine_args = AsyncEngineArgs(
+            model=args.checkpoint_path,
+            trust_remote_code=True,
+            gpu_memory_utilization=0.95,
             tensor_parallel_size=torch.cuda.device_count(),
             limit_mm_per_prompt={'image': 1, 'video': 5, 'audio': 10},
             max_num_seqs=1,
             max_model_len=32768,
             seed=1234,
         )
+        model = AsyncLLMEngine.from_engine_args(engine_args)
 
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
     return model, processor
@@ -178,44 +185,86 @@ def _launch_demo(args, model, processor):
 
         return messages
 
-    def predict(messages, voice_choice=DEFAULT_VOICE, temperature=0.7, top_p=0.8, top_k=20):
+    async def predict(messages, voice_choice=DEFAULT_VOICE, temperature=0.7, top_p=0.8, top_k=20, thinking_mode=True):
         print('predict history: ', messages)
         if use_transformers:
-            text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            from transformers import TextIteratorStreamer
+            try:
+                text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=thinking_mode)
+            except TypeError:
+                text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
             inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=True)
             inputs = inputs.to(model.device).to(model.dtype)
-            text_ids, audio = model.generate(**inputs, 
-                                             thinker_return_dict_in_generate=True,
-                                             thinker_max_new_tokens=32768, 
-                                             thinker_do_sample=True, 
-                                             thinker_temperature=temperature, 
-                                             thinker_top_p=top_p, 
-                                             thinker_top_k=top_k, 
-                                             speaker=voice_choice, 
-                                             use_audio_in_video=True)
-            response = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1] :], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-            yield {"type": "text", "data": response}
-            if audio is not None:
-                audio = np.array(audio.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
-                wav_io = io.BytesIO()
-                sf.write(wav_io, audio, samplerate=24000, format="WAV")
-                wav_bytes = wav_io.getvalue()
-                audio_path = processing_utils.save_bytes_to_cache(wav_bytes, "audio.wav", cache_dir=demo.GRADIO_CACHE)
-                yield {"type": "audio", "data": audio_path}
+
+            streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            gen_kwargs = dict(
+                **inputs,
+                thinker_return_dict_in_generate=True,
+                thinker_max_new_tokens=32768,
+                thinker_do_sample=True,
+                thinker_temperature=temperature,
+                thinker_top_p=top_p,
+                thinker_top_k=top_k,
+                speaker=voice_choice,
+                use_audio_in_video=True,
+                streamer=streamer,
+            )
+            gen_thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
+            t_start = time.perf_counter()
+            gen_thread.start()
+
+            loop = asyncio.get_running_loop()
+            _SENTINEL = object()
+            streamer_iter = iter(streamer)
+
+            def _next_token():
+                return next(streamer_iter, _SENTINEL)
+
+            partial_text = ""
+            first_token = True
+            while True:
+                new_token = await loop.run_in_executor(None, _next_token)
+                if new_token is _SENTINEL:
+                    break
+                if first_token:
+                    ttft = time.perf_counter() - t_start
+                    print(f"[TTFT] Time to first token (Transformers): {ttft:.3f}s")
+                    first_token = False
+                partial_text += new_token
+                yield {"type": "text", "data": partial_text}
+            gen_thread.join()
+            total = time.perf_counter() - t_start
+            print(f"[Timing] Total generation time: {total:.3f}s")
         else:
             sampling_params = SamplingParams(temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=16384)
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            try:
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking_mode)
+            except TypeError:
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
             inputs = {'prompt': text, 'multi_modal_data': {}, "mm_processor_kwargs": {"use_audio_in_video": True}}
             if images is not None: inputs['multi_modal_data']['image'] = images
             if videos is not None: inputs['multi_modal_data']['video'] = videos
             if audios is not None: inputs['multi_modal_data']['audio'] = audios
-            outputs = model.generate(inputs, sampling_params=sampling_params)
-            response = outputs[0].outputs[0].text
-            yield {"type": "text", "data": response}
 
-    def media_predict(audio, video, history, system_prompt, voice_choice, temperature, top_p, top_k):
+            request_id = str(uuid.uuid4())
+            t_start = time.perf_counter()
+            first_token = True
+            prev_text = ""
+            async for output in model.generate(inputs, sampling_params, request_id):
+                new_text = output.outputs[0].text
+                if new_text != prev_text:
+                    if first_token:
+                        ttft = time.perf_counter() - t_start
+                        print(f"[TTFT] Time to first token (vLLM streaming): {ttft:.3f}s")
+                        first_token = False
+                    prev_text = new_text
+                    yield {"type": "text", "data": new_text}
+            total = time.perf_counter() - t_start
+            print(f"[Timing] Total generation time: {total:.3f}s")
+
+    async def media_predict(audio, video, history, system_prompt, voice_choice, temperature, top_p, top_k, thinking_mode):
         yield (None, None, history, gr.update(visible=False), gr.update(visible=True))
         files = [audio, video];
         for f in files:
@@ -223,7 +272,7 @@ def _launch_demo(args, model, processor):
         yield (None, None, history, gr.update(visible=True), gr.update(visible=False))
         formatted_history = format_history(history=history, system_prompt=system_prompt)
         history.append({"role": "assistant", "content": ""})
-        for chunk in predict(formatted_history, voice_choice, temperature, top_p, top_k):
+        async for chunk in predict(formatted_history, voice_choice, temperature, top_p, top_k, thinking_mode):
             if chunk["type"] == "text":
                 history[-1]["content"] = chunk["data"]
                 yield (None, None, history, gr.update(visible=False), gr.update(visible=True))
@@ -231,7 +280,7 @@ def _launch_demo(args, model, processor):
                 history.append({"role": "assistant", "content": gr.Audio(chunk["data"], autoplay=False)})
         yield (None, None, history, gr.update(visible=True), gr.update(visible=False))
 
-    def chat_predict(text, audio, image, video, history, system_prompt, voice_choice, temperature, top_p, top_k):
+    async def chat_predict(text, audio, image, video, history, system_prompt, voice_choice, temperature, top_p, top_k, thinking_mode):
         user_content = []
         if audio: user_content.append((audio,))
         if image: user_content.append((image,))
@@ -244,7 +293,7 @@ def _launch_demo(args, model, processor):
         formatted_history = format_history(history=history, system_prompt=system_prompt)
         yield gr.update(value=None), gr.update(value=None), gr.update(value=None), gr.update(value=None), history
         history.append({"role": "assistant", "content": ""})
-        for chunk in predict(formatted_history, voice_choice, temperature, top_p, top_k):
+        async for chunk in predict(formatted_history, voice_choice, temperature, top_p, top_k, thinking_mode):
             if chunk["type"] == "text":
                 history[-1]["content"] = chunk["data"]
                 yield gr.skip(), gr.skip(), gr.skip(), gr.skip(), history
@@ -266,6 +315,7 @@ def _launch_demo(args, model, processor):
                 temperature = gr.Slider(label="Temperature", minimum=0.1, maximum=2.0, value=0.6, step=0.1)
                 top_p = gr.Slider(label="Top P", minimum=0.05, maximum=1.0, value=0.95, step=0.05)
                 top_k = gr.Slider(label="Top K", minimum=1, maximum=100, value=20, step=1)
+                thinking_mode = gr.Checkbox(label="Enable Thinking (启用思考模式)", value=True, info="Let the model reason before answering (Instruct model only)")
                 
             with gr.Column(scale=3): 
                 with gr.Tabs():
@@ -289,7 +339,7 @@ def _launch_demo(args, model, processor):
 
                         submit_event_online = submit_btn_online.click(
                             fn=media_predict,
-                            inputs=[microphone, webcam, media_chatbot, system_prompt_textbox, voice_choice, temperature, top_p, top_k],
+                            inputs=[microphone, webcam, media_chatbot, system_prompt_textbox, voice_choice, temperature, top_p, top_k, thinking_mode],
                             outputs=[microphone, webcam, media_chatbot, submit_btn_online, stop_btn_online]
                         )
                         stop_btn_online.click(fn=lambda: (gr.update(visible=True), gr.update(visible=False)), outputs=[submit_btn_online, stop_btn_online], cancels=[submit_event_online], queue=False)
@@ -318,7 +368,7 @@ def _launch_demo(args, model, processor):
                         submit_event_offline = gr.on(
                             triggers=[submit_btn_offline.click, text_input.submit],
                             fn=chat_predict,
-                            inputs=[text_input, audio_input, image_input, video_input, chatbot, system_prompt_textbox, voice_choice, temperature, top_p, top_k],
+                            inputs=[text_input, audio_input, image_input, video_input, chatbot, system_prompt_textbox, voice_choice, temperature, top_p, top_k, thinking_mode],
                             outputs=[text_input, audio_input, image_input, video_input, chatbot]
                         )
                         stop_btn_offline.click(fn=lambda: (gr.update(visible=True), gr.update(visible=False)), outputs=[submit_btn_offline, stop_btn_offline], cancels=[submit_event_offline], queue=False)
