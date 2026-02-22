@@ -21,52 +21,24 @@ from transformers import Qwen3OmniMoeProcessor
 
 
 def _load_model_processor(args):
-    # Check if flash-attn2 flag is enabled and load model accordingly
-    # THIS FUNCTION IS UNCHANGED
-    if args.use_transformers:
-        from transformers import Qwen3OmniMoeForConditionalGeneration
-        if args.flash_attn2:
-            model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(args.checkpoint_path,
-                                                                        dtype='auto',
-                                                                        attn_implementation='flash_attention_2',
-                                                                        device_map="auto")
-        else:
-            model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(args.checkpoint_path, device_map="auto", dtype='auto')
-    else:
-        from vllm import AsyncLLMEngine, AsyncEngineArgs
-        engine_args = AsyncEngineArgs(
-            model=args.checkpoint_path,
-            trust_remote_code=True,
-            gpu_memory_utilization=0.95,
-            tensor_parallel_size=torch.cuda.device_count(),
-            limit_mm_per_prompt={'image': 1, 'video': 5, 'audio': 10},
-            max_num_seqs=1,
-            max_model_len=32768,
-            seed=1234,
-        )
-        model = AsyncLLMEngine.from_engine_args(engine_args)
-
+    from vllm import AsyncLLMEngine, AsyncEngineArgs
+    engine_args = AsyncEngineArgs(
+        model=args.checkpoint_path,
+        trust_remote_code=True,
+        gpu_memory_utilization=0.95,
+        tensor_parallel_size=torch.cuda.device_count(),
+        limit_mm_per_prompt={'image': 1, 'video': 5, 'audio': 10},
+        max_num_seqs=1,
+        max_model_len=32768,
+        seed=1234,
+    )
+    model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
     return model, processor
 
 def _launch_demo(args, model, processor):
-    # --- Start of Function: UNCHANGED settings ---
-    # Voice settings
-    VOICE_LIST = ['Chelsie', 'Ethan', 'Aiden']
-    DEFAULT_VOICE = 'Chelsie'
+    from vllm import SamplingParams
     default_system_prompt = ''
-    use_transformers = args.use_transformers
-    generate_audio = args.generate_audio
-    if not use_transformers:
-        if generate_audio:
-            print("Generating audio is not supported with vLLM. Please use the 'python web_demo.py --use-transformers --generate-audio --flash-attn2' instead.")
-        from vllm import SamplingParams
-    
-    if use_transformers:
-        if generate_audio:
-            default_system_prompt = """You are a virtual voice assistant with no gender or age.\nYou are communicating with the user.\nIn user messages, “I/me/my/we/our” refer to the user and “you/your” refer to the assistant. In your replies, address the user as “you/your” and yourself as “I/me/my”; never mirror the user’s pronouns—always shift perspective. Keep original pronouns only in direct quotes; if a reference is unclear, ask a brief clarifying question.\nInteract with users using short(no more than 50 words), brief, straightforward language, maintaining a natural tone.\nNever use formal phrasing, mechanical expressions, bullet points, overly structured language. \nYour output must consist only of the spoken content you want the user to hear. \nDo not include any descriptions of actions, emotions, sounds, or voice changes. \nDo not use asterisks, brackets, parentheses, or any other symbols to indicate tone or actions. \nYou must answer users' audio or text questions, do not directly describe the video content. \nYou should communicate in the same language strictly as the user unless they request otherwise.\nWhen you are uncertain (e.g., you can't see/hear clearly, don't understand, or the user makes a comment rather than asking a question), use appropriate questions to guide the user to continue the conversation.\nKeep replies concise and conversational, as if talking face-to-face."""
-        else:
-            model.disable_talker()
 
     def to_mp4(path):
         import subprocess
@@ -185,102 +157,50 @@ def _launch_demo(args, model, processor):
 
         return messages
 
-    async def predict(messages, voice_choice=DEFAULT_VOICE, temperature=0.7, top_p=0.8, top_k=20, thinking_mode=True):
+    async def predict(messages, temperature=0.7, top_p=0.8, top_k=20, thinking_mode=True):
         print('predict history: ', messages)
-        if use_transformers:
-            from transformers import TextIteratorStreamer
-            try:
-                text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=thinking_mode)
-            except TypeError:
-                text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
-            inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=True)
-            inputs = inputs.to(model.device).to(model.dtype)
+        sampling_params = SamplingParams(temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=16384)
+        try:
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking_mode)
+        except TypeError:
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
+        inputs = {'prompt': text, 'multi_modal_data': {}, "mm_processor_kwargs": {"use_audio_in_video": True}}
+        if images is not None: inputs['multi_modal_data']['image'] = images
+        if videos is not None: inputs['multi_modal_data']['video'] = videos
+        if audios is not None: inputs['multi_modal_data']['audio'] = audios
 
-            streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
-            gen_kwargs = dict(
-                **inputs,
-                thinker_return_dict_in_generate=True,
-                thinker_max_new_tokens=32768,
-                thinker_do_sample=True,
-                thinker_temperature=temperature,
-                thinker_top_p=top_p,
-                thinker_top_k=top_k,
-                speaker=voice_choice,
-                use_audio_in_video=True,
-                streamer=streamer,
-            )
-            gen_thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
-            t_start = time.perf_counter()
-            gen_thread.start()
-
-            loop = asyncio.get_running_loop()
-            _SENTINEL = object()
-            streamer_iter = iter(streamer)
-
-            def _next_token():
-                return next(streamer_iter, _SENTINEL)
-
-            partial_text = ""
-            first_token = True
-            while True:
-                new_token = await loop.run_in_executor(None, _next_token)
-                if new_token is _SENTINEL:
-                    break
+        request_id = str(uuid.uuid4())
+        t_start = time.perf_counter()
+        first_token = True
+        prev_text = ""
+        async for output in model.generate(inputs, sampling_params, request_id):
+            new_text = output.outputs[0].text
+            if new_text != prev_text:
                 if first_token:
                     ttft = time.perf_counter() - t_start
-                    print(f"[TTFT] Time to first token (Transformers): {ttft:.3f}s")
+                    print(f"[TTFT] Time to first token (vLLM streaming): {ttft:.3f}s")
                     first_token = False
-                partial_text += new_token
-                yield {"type": "text", "data": partial_text}
-            gen_thread.join()
-            total = time.perf_counter() - t_start
-            print(f"[Timing] Total generation time: {total:.3f}s")
-        else:
-            sampling_params = SamplingParams(temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=16384)
-            try:
-                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=thinking_mode)
-            except TypeError:
-                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
-            inputs = {'prompt': text, 'multi_modal_data': {}, "mm_processor_kwargs": {"use_audio_in_video": True}}
-            if images is not None: inputs['multi_modal_data']['image'] = images
-            if videos is not None: inputs['multi_modal_data']['video'] = videos
-            if audios is not None: inputs['multi_modal_data']['audio'] = audios
+                prev_text = new_text
+                yield {"type": "text", "data": new_text}
+        total = time.perf_counter() - t_start
+        print(f"[Timing] Total generation time: {total:.3f}s")
 
-            request_id = str(uuid.uuid4())
-            t_start = time.perf_counter()
-            first_token = True
-            prev_text = ""
-            async for output in model.generate(inputs, sampling_params, request_id):
-                new_text = output.outputs[0].text
-                if new_text != prev_text:
-                    if first_token:
-                        ttft = time.perf_counter() - t_start
-                        print(f"[TTFT] Time to first token (vLLM streaming): {ttft:.3f}s")
-                        first_token = False
-                    prev_text = new_text
-                    yield {"type": "text", "data": new_text}
-            total = time.perf_counter() - t_start
-            print(f"[Timing] Total generation time: {total:.3f}s")
-
-    async def media_predict(audio, video, history, system_prompt, voice_choice, temperature, top_p, top_k, thinking_mode):
+    async def media_predict(audio, video, history, system_prompt, temperature, top_p, top_k, thinking_mode):
         yield (None, None, history, gr.update(visible=False), gr.update(visible=True))
-        files = [audio, video];
+        files = [audio, video]
         for f in files:
             if f: history.append({"role": "user", "content": (f,)})
         yield (None, None, history, gr.update(visible=True), gr.update(visible=False))
         formatted_history = format_history(history=history, system_prompt=system_prompt)
         history.append({"role": "assistant", "content": ""})
-        async for chunk in predict(formatted_history, voice_choice, temperature, top_p, top_k, thinking_mode):
+        async for chunk in predict(formatted_history, temperature, top_p, top_k, thinking_mode):
             if chunk["type"] == "text":
                 history[-1]["content"] = chunk["data"]
                 yield (None, None, history, gr.update(visible=False), gr.update(visible=True))
-            if chunk["type"] == "audio":
-                history.append({"role": "assistant", "content": gr.Audio(chunk["data"], autoplay=False)})
         yield (None, None, history, gr.update(visible=True), gr.update(visible=False))
 
-    async def chat_predict(text, audio, image, video, history, system_prompt, voice_choice, temperature, top_p, top_k, thinking_mode):
+    async def chat_predict(text, audio, image, video, history, system_prompt, temperature, top_p, top_k, thinking_mode):
         user_content = []
         if audio: user_content.append((audio,))
         if image: user_content.append((image,))
@@ -293,12 +213,10 @@ def _launch_demo(args, model, processor):
         formatted_history = format_history(history=history, system_prompt=system_prompt)
         yield gr.update(value=None), gr.update(value=None), gr.update(value=None), gr.update(value=None), history
         history.append({"role": "assistant", "content": ""})
-        async for chunk in predict(formatted_history, voice_choice, temperature, top_p, top_k, thinking_mode):
+        async for chunk in predict(formatted_history, temperature, top_p, top_k, thinking_mode):
             if chunk["type"] == "text":
                 history[-1]["content"] = chunk["data"]
                 yield gr.skip(), gr.skip(), gr.skip(), gr.skip(), history
-            if chunk["type"] == "audio":
-                history.append({"role": "assistant", "content": gr.Audio(chunk["data"], autoplay=False)})
         yield gr.skip(), gr.skip(), gr.skip(), gr.skip(), history
     
     # --- CORRECTED UI LAYOUT ---
@@ -311,7 +229,6 @@ def _launch_demo(args, model, processor):
             with gr.Column(scale=1): 
                 gr.Markdown("### ⚙️ Parameters (参数)")
                 system_prompt_textbox = gr.Textbox(label="System Prompt", value=default_system_prompt, lines=4, max_lines=8)
-                voice_choice = gr.Dropdown(label="Voice Choice", choices=VOICE_LIST, value=DEFAULT_VOICE, visible=generate_audio)
                 temperature = gr.Slider(label="Temperature", minimum=0.1, maximum=2.0, value=0.6, step=0.1)
                 top_p = gr.Slider(label="Top P", minimum=0.05, maximum=1.0, value=0.95, step=0.05)
                 top_k = gr.Slider(label="Top K", minimum=1, maximum=100, value=20, step=1)
@@ -339,7 +256,7 @@ def _launch_demo(args, model, processor):
 
                         submit_event_online = submit_btn_online.click(
                             fn=media_predict,
-                            inputs=[microphone, webcam, media_chatbot, system_prompt_textbox, voice_choice, temperature, top_p, top_k, thinking_mode],
+                            inputs=[microphone, webcam, media_chatbot, system_prompt_textbox, temperature, top_p, top_k, thinking_mode],
                             outputs=[microphone, webcam, media_chatbot, submit_btn_online, stop_btn_online]
                         )
                         stop_btn_online.click(fn=lambda: (gr.update(visible=True), gr.update(visible=False)), outputs=[submit_btn_online, stop_btn_online], cancels=[submit_event_online], queue=False)
@@ -368,7 +285,7 @@ def _launch_demo(args, model, processor):
                         submit_event_offline = gr.on(
                             triggers=[submit_btn_offline.click, text_input.submit],
                             fn=chat_predict,
-                            inputs=[text_input, audio_input, image_input, video_input, chatbot, system_prompt_textbox, voice_choice, temperature, top_p, top_k, thinking_mode],
+                            inputs=[text_input, audio_input, image_input, video_input, chatbot, system_prompt_textbox, temperature, top_p, top_k, thinking_mode],
                             outputs=[text_input, audio_input, image_input, video_input, chatbot]
                         )
                         stop_btn_offline.click(fn=lambda: (gr.update(visible=True), gr.update(visible=False)), outputs=[submit_btn_offline, stop_btn_offline], cancels=[submit_event_offline], queue=False)
@@ -381,11 +298,11 @@ def _launch_demo(args, model, processor):
             </style>
         """)
 
-    demo.queue(default_concurrency_limit=1 if use_transformers else 100, max_size=100).launch(max_threads=100, ssr_mode=False, share=args.share, inbrowser=args.inbrowser, server_port=args.server_port, server_name=args.server_name)
+    demo.queue(default_concurrency_limit=100, max_size=100).launch(max_threads=100, ssr_mode=False, share=args.share, inbrowser=args.inbrowser, server_port=args.server_port, server_name=args.server_name)
 
 
 
-DEFAULT_CKPT_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
 
 def _get_args():
     # THIS FUNCTION IS UNCHANGED
@@ -396,18 +313,6 @@ def _get_args():
                         type=str,
                         default=DEFAULT_CKPT_PATH,
                         help='Checkpoint name or path, default to %(default)r')
-    parser.add_argument('--generate-audio',
-                        action='store_true',
-                        default=False,
-                        help='Enable audio generation.')
-    parser.add_argument('--flash-attn2',
-                        action='store_true',
-                        default=False,
-                        help='Enable flash_attention_2 when loading the model for transformers.')
-    parser.add_argument('--use-transformers',
-                        action='store_true',
-                        default=False,
-                        help='Use transformers for inference.')
     parser.add_argument('--share',
                         action='store_true',
                         default=False,
