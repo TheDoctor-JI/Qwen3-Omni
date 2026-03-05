@@ -477,6 +477,85 @@ textarea.sys-prompt:focus { outline: none; border-color: var(--accent); }
 }
 .file-clear.visible { display: block; }
 
+/* ── Audio recorder ─────────────────────────────────────────────────────── */
+.audio-section { margin-bottom: 4px; }
+.audio-tabs { display: flex; gap: 4px; margin-bottom: 6px; }
+.atab {
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: .75rem;
+  font-weight: 600;
+  padding: 4px 0;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.atab:hover { background: var(--border); color: var(--text); }
+.atab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+#waveform {
+  width: 100%;
+  height: 48px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: block;
+}
+.rec-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.mic-btn {
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  background: var(--surface2);
+  font-size: 1.15rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color .15s, background .15s;
+  flex-shrink: 0;
+  line-height: 1;
+}
+.mic-btn:hover { border-color: var(--accent); }
+.mic-btn.recording {
+  border-color: var(--red);
+  background: rgba(239,68,68,.15);
+  animation: recPulse 1s ease-in-out infinite;
+}
+@keyframes recPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,.5); }
+  50%       { box-shadow: 0 0 0 7px rgba(239,68,68,0); }
+}
+.rec-timer {
+  font-size: .85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent2);
+  min-width: 38px;
+}
+.rec-status { font-size: .72rem; color: var(--muted); }
+.rec-status.live { color: var(--red); font-weight: 600; }
+#audio-preview {
+  width: 100%;
+  margin-top: 7px;
+  display: none;
+  accent-color: var(--accent);
+  border-radius: 6px;
+}
+.rec-discard {
+  font-size: .72rem;
+  color: var(--red);
+  cursor: pointer;
+  display: none;
+  margin-top: 3px;
+}
+.rec-discard.visible { display: block; }
+
 .btn-clear-hist {
   margin: 14px 16px 0;
   width: calc(100% - 32px);
@@ -734,13 +813,35 @@ details[open].think-details summary::before { transform: rotate(90deg); }
     <div class="sb-section">
       <div class="sb-title">Media Attachments</div>
 
-      <!-- Audio -->
-      <div class="file-drop-wrap">
-        <div class="file-drop" id="drop-audio">
-          🎵 Audio (.wav / .mp3 / .ogg)
-          <input type="file" id="file-audio" accept="audio/*">
+      <!-- Audio: tabbed upload / live record -->
+      <div class="audio-section">
+        <div class="audio-tabs">
+          <button class="atab active" id="atab-upload" onclick="switchAudioTab('upload')">📁 Upload</button>
+          <button class="atab"        id="atab-record" onclick="switchAudioTab('record')">🎙 Record</button>
         </div>
-        <span class="file-clear" id="clear-audio" onclick="clearFile('audio')">✕ remove</span>
+
+        <!-- Upload pane -->
+        <div id="apane-upload">
+          <div class="file-drop-wrap">
+            <div class="file-drop" id="drop-audio">
+              🎵 Audio (.wav / .mp3 / .ogg)
+              <input type="file" id="file-audio" accept="audio/*">
+            </div>
+            <span class="file-clear" id="clear-audio" onclick="clearFile('audio')">✕ remove</span>
+          </div>
+        </div>
+
+        <!-- Record pane -->
+        <div id="apane-record" style="display:none">
+          <canvas id="waveform" width="256" height="48"></canvas>
+          <div class="rec-row">
+            <button class="mic-btn" id="mic-btn" onclick="toggleRecording()" title="Start recording">🎙</button>
+            <span class="rec-timer" id="rec-timer">00:00</span>
+            <span class="rec-status" id="rec-status">Ready</span>
+          </div>
+          <audio id="audio-preview" controls></audio>
+          <span class="rec-discard" id="rec-discard" onclick="clearRecording()">✕ discard recording</span>
+        </div>
       </div>
 
       <!-- Image -->
@@ -816,6 +917,16 @@ let tStart    = 0;
 
 // Pending file payloads: {data, suffix, name}
 const pending = { audio: null, image: null, video: null };
+
+// ── Mic recorder state ────────────────────────────────────────────────────
+let mediaRecorder  = null;
+let audioChunks    = [];
+let recStream      = null;
+let recTimerSec    = 0;
+let recTimerHandle = null;
+let audioCtx       = null;
+let analyser       = null;
+let waveAnimHandle = null;
 
 // ── Connect ───────────────────────────────────────────────────────────────
 function connect() {
@@ -1067,6 +1178,172 @@ function clearFile(type) {
   document.getElementById('clear-' + type).classList.remove('visible');
 }
 
+// Clear audio from whichever tab supplied it, used after send
+function clearAudioAfterSend() {
+  pending.audio = null;
+  // Reset upload pane
+  const drop = document.getElementById('drop-audio');
+  drop.classList.remove('loaded');
+  drop.childNodes[0].textContent = FILE_META.audio.icon + ' ' + FILE_META.audio.label + ' ';
+  document.getElementById('file-audio').value = '';
+  document.getElementById('clear-audio').classList.remove('visible');
+  // Reset record pane (non-destructively — don't stop an active recording)
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') clearRecording();
+}
+
+// ── Audio recorder ────────────────────────────────────────────────────────
+function switchAudioTab(tab) {
+  document.getElementById('apane-upload').style.display = tab === 'upload' ? ''     : 'none';
+  document.getElementById('apane-record').style.display = tab === 'record' ? ''     : 'none';
+  document.getElementById('atab-upload').classList.toggle('active', tab === 'upload');
+  document.getElementById('atab-record').classList.toggle('active', tab === 'record');
+  // Stop any active recording when leaving the tab
+  if (tab !== 'record' && mediaRecorder && mediaRecorder.state === 'recording') stopRecording();
+}
+
+function toggleRecording() {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+    startRecording();
+  } else {
+    stopRecording();
+  }
+}
+
+async function startRecording() {
+  clearRecording();   // discard any previous take
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    showError('Microphone access denied: ' + e.message);
+    return;
+  }
+
+  // Waveform analyser
+  audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+  const src = audioCtx.createMediaStreamSource(recStream);
+  analyser  = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  src.connect(analyser);
+  drawWaveform();
+
+  audioChunks = [];
+  const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus'
+             : MediaRecorder.isTypeSupported('audio/webm')             ? 'audio/webm'
+             : '';
+  mediaRecorder = new MediaRecorder(recStream, mime ? { mimeType: mime } : {});
+  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+  mediaRecorder.onstop = onRecordingStop;
+  mediaRecorder.start(100);
+
+  // UI
+  document.getElementById('mic-btn').classList.add('recording');
+  document.getElementById('mic-btn').textContent    = '⏹';
+  document.getElementById('mic-btn').title          = 'Stop recording';
+  document.getElementById('rec-status').textContent = '● Recording';
+  document.getElementById('rec-status').classList.add('live');
+  document.getElementById('audio-preview').style.display = 'none';
+  document.getElementById('rec-discard').classList.remove('visible');
+
+  // Timer
+  recTimerSec = 0;
+  document.getElementById('rec-timer').textContent = '00:00';
+  recTimerHandle = setInterval(() => {
+    recTimerSec++;
+    document.getElementById('rec-timer').textContent = recFmtTime(recTimerSec);
+  }, 1000);
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  if (recTimerHandle) { clearInterval(recTimerHandle); recTimerHandle = null; }
+  if (waveAnimHandle) { cancelAnimationFrame(waveAnimHandle); waveAnimHandle = null; }
+  if (recStream)  { recStream.getTracks().forEach(t => t.stop()); recStream = null; }
+  if (audioCtx)   { audioCtx.close(); audioCtx = null; analyser = null; }
+  document.getElementById('mic-btn').classList.remove('recording');
+  document.getElementById('mic-btn').textContent    = '🎙';
+  document.getElementById('mic-btn').title          = 'Start recording';
+  document.getElementById('rec-status').textContent = 'Processing…';
+  document.getElementById('rec-status').classList.remove('live');
+  const canvas = document.getElementById('waveform');
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function onRecordingStop() {
+  const mimeType = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
+  const suffix   = mimeType.includes('ogg') ? '.ogg' : '.webm';
+  const blob     = new Blob(audioChunks, { type: mimeType });
+  const url      = URL.createObjectURL(blob);
+
+  const preview = document.getElementById('audio-preview');
+  if (preview.src) URL.revokeObjectURL(preview.src);
+  preview.src             = url;
+  preview.style.display   = 'block';
+
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const b64 = ev.target.result.split(',')[1];
+    pending.audio = { data: b64, suffix, name: 'recording' + suffix };
+    document.getElementById('rec-status').textContent = '✔ Ready  (' + recFmtTime(recTimerSec) + ')';
+    document.getElementById('rec-discard').classList.add('visible');
+  };
+  reader.readAsDataURL(blob);
+}
+
+function clearRecording() {
+  pending.audio = null;
+  audioChunks   = [];
+  const preview = document.getElementById('audio-preview');
+  if (preview && preview.src) { URL.revokeObjectURL(preview.src); preview.removeAttribute('src'); }
+  if (preview) preview.style.display = 'none';
+  const disc   = document.getElementById('rec-discard');
+  if (disc)    disc.classList.remove('visible');
+  const status = document.getElementById('rec-status');
+  if (status)  { status.textContent = 'Ready'; status.classList.remove('live'); }
+  recTimerSec = 0;
+  const timer = document.getElementById('rec-timer');
+  if (timer)   timer.textContent = '00:00';
+}
+
+function recFmtTime(sec) {
+  return String(Math.floor(sec / 60)).padStart(2, '0') + ':' +
+         String(sec % 60).padStart(2, '0');
+}
+
+function drawWaveform() {
+  if (!analyser) return;
+  const canvas = document.getElementById('waveform');
+  // Match internal resolution to CSS size once
+  canvas.width  = canvas.clientWidth  || 256;
+  canvas.height = canvas.clientHeight || 48;
+  const ctx    = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const bufLen = analyser.frequencyBinCount;
+  const data   = new Uint8Array(bufLen);
+  const bg     = getComputedStyle(document.documentElement).getPropertyValue('--surface2').trim();
+  const fg     = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+
+  function render() {
+    if (!analyser) return;
+    waveAnimHandle = requestAnimationFrame(render);
+    analyser.getByteTimeDomainData(data);
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineWidth   = 1.8;
+    ctx.strokeStyle = fg;
+    ctx.beginPath();
+    const sliceW = W / bufLen;
+    let x = 0;
+    for (let i = 0; i < bufLen; i++) {
+      const y = (data[i] / 128.0) * (H / 2);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      x += sliceW;
+    }
+    ctx.lineTo(W, H / 2);
+    ctx.stroke();
+  }
+  render();
+}
+
 // ── Send & Stop ───────────────────────────────────────────────────────────
 function sendMessage() {
   if (generating) return;
@@ -1108,7 +1385,9 @@ function sendMessage() {
   };
 
   // Clear attached files after send
-  ['audio', 'image', 'video'].forEach(t => { if (pending[t]) clearFile(t); });
+  if (pending.audio) clearAudioAfterSend();
+  if (pending.image) clearFile('image');
+  if (pending.video) clearFile('video');
 
   socket.emit('generate', payload);
 }
