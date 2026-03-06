@@ -22,8 +22,9 @@ Socket.IO protocol
   Client → Server events:
     "generate"  { text, files:{audio?,image?,video?}, history:[],
                   system_prompt, params:{temperature,top_p,top_k,
-                  max_tokens,thinking_mode} }
-    "stop"      {}   — cancel the running generation
+                  max_tokens,thinking_mode},
+                  request_id? }   — request_id is optional; server generates one if absent
+    "stop"      { request_id? }  — cancel the running generation
 
   Server → Client events:
     "server_ready"         { sid }
@@ -151,7 +152,7 @@ def _build_messages(payload):
 async def _stream_generate(sio, sid, model, processor, payload):
     from vllm import SamplingParams
 
-    request_id = str(uuid.uuid4())
+    request_id = payload.get('request_id') or str(uuid.uuid4())
     p = payload.get("params") or {}
     temperature   = float(p.get("temperature",  0.7))
     top_p         = float(p.get("top_p",        0.95))
@@ -261,7 +262,27 @@ def create_socketio_app(model, processor):
     app = web.Application()
     sio.attach(app)
 
-    _active = {}   # sid -> asyncio.Task
+    _active = {}   # sid -> (asyncio.Task, request_id: str)
+
+    async def _abort_active(sid, reason: str):
+        """Cancel the active task for *sid* and abort the vLLM request.
+
+        Calls model.abort(request_id) to immediately stop engine-side token
+        generation, then cancels the asyncio task so CancelledError propagates
+        and the server emits generation_stopped.  Abort failures are logged
+        but never raised — cancellation is solely client-driven.
+        """
+        entry = _active.pop(sid, None)
+        if entry is None:
+            return
+        task, req_id = entry
+        if task and not task.done():
+            try:
+                await model.abort(req_id)
+            except Exception as e:
+                print(f"[!] model.abort({req_id}) failed ({reason}): {e}")
+            task.cancel()
+            print(f"[x] {reason}: cancelled task for {sid} (request_id={req_id})")
 
     @sio.on("connect")
     async def on_connect(sid, environ):
@@ -271,26 +292,23 @@ def create_socketio_app(model, processor):
     @sio.on("disconnect")
     async def on_disconnect(sid):
         print(f"[-] disconnect {sid}")
-        task = _active.pop(sid, None)
-        if task and not task.done():
-            task.cancel()
+        await _abort_active(sid, "disconnect")
 
     @sio.on("generate")
     async def on_generate(sid, payload):
         # Cancel any in-flight generation before starting a new one
-        old = _active.pop(sid, None)
-        if old and not old.done():
-            old.cancel()
+        await _abort_active(sid, "new generate")
+        request_id = payload.get('request_id') or str(uuid.uuid4())
+        # Inject the resolved request_id back so _stream_generate uses it
+        payload['request_id'] = request_id
         task = asyncio.create_task(
             _stream_generate(sio, sid, model, processor, payload)
         )
-        _active[sid] = task
+        _active[sid] = (task, request_id)
 
     @sio.on("stop")
-    async def on_stop(sid, _=None):
-        task = _active.pop(sid, None)
-        if task and not task.done():
-            task.cancel()
+    async def on_stop(sid, payload=None):
+        await _abort_active(sid, "stop")
 
     async def handle_index(request):
         return web.Response(text=_GUI_HTML, content_type="text/html")
