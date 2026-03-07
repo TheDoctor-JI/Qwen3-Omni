@@ -20,8 +20,8 @@ Usage:
 Socket.IO protocol
 ------------------
   Client → Server events:
-    "generate"  { text, files:{audio?,image?,video?}, history:[],
-                  system_prompt, params:{temperature,top_p,top_k,
+    "generate"  { messages: [{role, content: [{type, ...}]}],
+                  params:{temperature,top_p,top_k,
                   max_tokens,thinking_mode},
                   request_id? }   — request_id is optional; server generates one if absent
     "stop"      { request_id? }  — cancel the running generation
@@ -36,8 +36,13 @@ Socket.IO protocol
     "generation_stopped"   { request_id, partial_text }
     "generation_error"     { request_id, error }
 
-File format (inside "files"):
-    Each value is  { data: "<base64>", suffix: ".wav" }  (suffix optional).
+Message format (inside "messages"):
+    Each message is {role: str, content: [{type, ...}]}.
+    Text items:  {type: "text", text: "..."}
+    Audio items: {type: "audio", data: "<base64>", suffix: ".wav"}
+    Image items: {type: "image", data: "<base64>", suffix: ".jpg"}
+    Video items: {type: "video", data: "<base64>", suffix: ".mp4"}
+    Roles: "system", "user", "assistant", "tool"
 """
 
 import asyncio
@@ -118,52 +123,57 @@ def _save_temp_b64(data_b64, suffix):
     return path
 
 
-def _normalize_msg(msg):
-    """Convert {role, content: str} → {role, content: [{type:text,text:...}]}
-    so that process_mm_info can iterate over content safely."""
-    content = msg.get("content")
-    if isinstance(content, str):
-        return {"role": msg["role"],
-                "content": [{"type": "text", "text": content}]}
-    return msg
-
-
 def _build_messages(payload):
     """
-    Convert a socket payload dict into (messages_list, temp_file_paths).
+    Convert a socket payload into (messages_list, temp_file_paths).
 
-    'messages_list' is ready for processor.apply_chat_template and
-    process_mm_info.  Caller is responsible for deleting temp files.
+    The payload uses the messages-based protocol where every turn is a
+    structured message with inline base64 media.  This function
+    materialises any base64 media blobs to temp files (so that
+    process_mm_info / apply_chat_template can reference file paths),
+    and returns a messages list ready for the model pipeline.
+
+    Caller is responsible for deleting temp files afterwards.
     """
     messages = []
     temp_files = []
 
-    system_prompt = (payload.get("system_prompt") or "").strip()
-    if system_prompt:
-        messages.append({
-            "role": "system",
-            "content": [{"type": "text", "text": system_prompt}],
-        })
-
-    for msg in payload.get("history") or []:
-        messages.append(_normalize_msg(msg))
-
-    user_content = []
     default_suffixes = {"audio": ".wav", "image": ".jpg", "video": ".mp4"}
-    for media_type, default_suffix in default_suffixes.items():
-        entry = (payload.get("files") or {}).get(media_type)
-        if entry and entry.get("data"):
-            suffix = entry.get("suffix") or default_suffix
-            path = _save_temp_b64(entry["data"], suffix)
-            temp_files.append(path)
-            user_content.append({"type": media_type, media_type: path})
 
-    text = (payload.get("text") or "").strip()
-    if text:
-        user_content.append({"type": "text", "text": text})
+    for msg in payload.get("messages") or []:
+        role = msg.get("role", "user")
+        raw_content = msg.get("content")
 
-    if user_content:
-        messages.append({"role": "user", "content": user_content})
+        # Normalise content to list-of-dicts
+        if isinstance(raw_content, str):
+            raw_content = [{"type": "text", "text": raw_content}]
+        if not isinstance(raw_content, list):
+            continue
+
+        out_content = []
+        for item in raw_content:
+            item_type = item.get("type", "text")
+
+            if item_type in default_suffixes and item.get("data"):
+                # Inline base64 media — materialise to temp file
+                suffix = item.get("suffix") or default_suffixes[item_type]
+                path = _save_temp_b64(item["data"], suffix)
+                temp_files.append(path)
+                out_content.append({"type": item_type, item_type: path})
+
+            elif item_type in default_suffixes and item.get(item_type):
+                # Already a file path (e.g. local testing) — pass through
+                out_content.append(item)
+
+            elif item_type == "text":
+                out_content.append({"type": "text", "text": item.get("text", "")})
+
+            else:
+                # Unknown item type — pass through
+                out_content.append(item)
+
+        if out_content:
+            messages.append({"role": role, "content": out_content})
 
     return messages, temp_files
 
@@ -1012,14 +1022,14 @@ function connect() {
       d.total_time + 's'
     );
     setStatus('done');
-    history.push({ role: 'assistant', content: d.full_text });
+    history.push({ role: 'assistant', content: [{type: 'text', text: d.full_text}] });
     setGenerating(false);
   });
 
   socket.on('generation_stopped', (d) => {
     finalizeAsst(d.partial_text || null);
     setStatus('stopped');
-    if (d.partial_text) history.push({ role: 'assistant', content: d.partial_text });
+    if (d.partial_text) history.push({ role: 'assistant', content: [{type: 'text', text: d.partial_text}] });
     setGenerating(false);
   });
 
@@ -1395,10 +1405,15 @@ function sendMessage() {
   const hasFiles = { audio: !!pending.audio, image: !!pending.image, video: !!pending.video };
   if (!text && !hasFiles.audio && !hasFiles.image && !hasFiles.video) return;
 
-  // Record user turn in history (text only)
-  const userContent = [text, hasFiles.audio?'[audio]':'', hasFiles.image?'[image]':'', hasFiles.video?'[video]':'']
-    .filter(Boolean).join(' ').trim();
-  history.push({ role: 'user', content: userContent });
+  // Build user content items
+  const userContent = [];
+  if (pending.audio) userContent.push({type: 'audio', data: pending.audio.data, suffix: pending.audio.suffix || '.wav'});
+  if (pending.image) userContent.push({type: 'image', data: pending.image.data, suffix: pending.image.suffix || '.jpg'});
+  if (pending.video) userContent.push({type: 'video', data: pending.video.data, suffix: pending.video.suffix || '.mp4'});
+  if (text) userContent.push({type: 'text', text});
+
+  // Push to history
+  history.push({role: 'user', content: userContent});
 
   addUserBubble(text, hasFiles);
 
@@ -1407,15 +1422,14 @@ function sendMessage() {
 
   setGenerating(true);
 
+  // Build messages: system prompt + full history (including current user turn)
+  const messages = [];
+  const sysPrompt = document.getElementById('system-prompt').value.trim();
+  if (sysPrompt) messages.push({role: 'system', content: [{type: 'text', text: sysPrompt}]});
+  for (const h of history) messages.push(h);
+
   const payload = {
-    text,
-    files: {
-      audio: pending.audio || null,
-      image: pending.image || null,
-      video: pending.video || null,
-    },
-    history: history.slice(0, -1),   // history BEFORE current user turn
-    system_prompt: document.getElementById('system-prompt').value,
+    messages,
     params: {
       temperature:   parseFloat(document.getElementById('s-temp').value),
       top_p:         parseFloat(document.getElementById('s-top-p').value),
