@@ -82,6 +82,9 @@ def _load_config(config_path):
 def _load_model_processor(args):
     config = _load_config(getattr(args, 'config', None))
 
+    model_cfg = config.get('model', {})
+    max_num_seqs = int(model_cfg.get('max_num_seqs', 2))
+
     from vllm import AsyncLLMEngine, AsyncEngineArgs
     engine_args = AsyncEngineArgs(
         model=args.checkpoint_path,
@@ -89,10 +92,11 @@ def _load_model_processor(args):
         gpu_memory_utilization=0.8,
         tensor_parallel_size=torch.cuda.device_count(),
         limit_mm_per_prompt={'image': 1, 'video': 5, 'audio': 10},
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         max_model_len=65535,
         seed=1234,
     )
+    print(f"[*] max_num_seqs = {max_num_seqs}")
     model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
 
@@ -179,13 +183,19 @@ def _build_messages(payload):
 
 
 # ---------------------------------------------------------------------------
-# Core streaming generation coroutine
+# Preprocessing (synchronous — run in a thread to keep the event loop free)
 # ---------------------------------------------------------------------------
 
-async def _stream_generate(sio, sid, model, processor, payload):
+def _prepare_inputs(processor, payload):
+    """Build vLLM inputs from a Socket.IO payload.
+
+    This function is intentionally synchronous: apply_chat_template,
+    process_mm_info, and base64-decoding are all CPU-bound and would block
+    the asyncio event loop.  Callers should schedule it via
+    ``asyncio.to_thread``.
+    """
     from vllm import SamplingParams
 
-    request_id = payload.get('request_id') or str(uuid.uuid4())
     p = payload.get("params") or {}
     temperature   = float(p.get("temperature",  0.7))
     top_p         = float(p.get("top_p",        0.95))
@@ -224,6 +234,23 @@ async def _stream_generate(sio, sid, model, processor, payload):
     if images is not None: inputs["multi_modal_data"]["image"] = images
     if videos is not None: inputs["multi_modal_data"]["video"] = videos
     if audios is not None: inputs["multi_modal_data"]["audio"] = audios
+
+    return inputs, sampling_params, temp_files
+
+
+# ---------------------------------------------------------------------------
+# Core streaming generation coroutine
+# ---------------------------------------------------------------------------
+
+async def _stream_generate(sio, sid, model, processor, payload):
+    request_id = payload.get('request_id') or str(uuid.uuid4())
+
+    # Offload blocking preprocessing (base64 decode, tokenization,
+    # audio/image feature extraction) to a worker thread so the event
+    # loop stays responsive for new connections and other events.
+    inputs, sampling_params, temp_files = await asyncio.to_thread(
+        _prepare_inputs, processor, payload
+    )
 
     await sio.emit("generation_start", {"request_id": request_id}, to=sid)
 
@@ -1521,4 +1548,5 @@ if __name__ == "__main__":
     model, processor = _load_model_processor(args)
     print(f"[*] Model loaded. Serving GUI + Socket.IO on http://{args.host}:{args.port}")
     app = create_socketio_app(model, processor)
-    web.run_app(app, host=args.host, port=args.port)
+    # Suppress the default "Running on ..." banner from aiohttp
+    web.run_app(app, host=args.host, port=args.port, print=lambda _: None)
