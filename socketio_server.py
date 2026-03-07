@@ -70,7 +70,7 @@ def _load_model_processor(args):
     engine_args = AsyncEngineArgs(
         model=args.checkpoint_path,
         trust_remote_code=True,
-        gpu_memory_utilization=0.95,
+        gpu_memory_utilization=0.66,
         tensor_parallel_size=torch.cuda.device_count(),
         limit_mm_per_prompt={'image': 1, 'video': 5, 'audio': 10},
         max_num_seqs=1,
