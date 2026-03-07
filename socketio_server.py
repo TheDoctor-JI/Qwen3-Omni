@@ -48,6 +48,7 @@ import time
 import uuid
 
 import torch
+import yaml
 
 os.environ['VLLM_USE_V1'] = '0'
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
@@ -65,20 +66,42 @@ DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
 # Model loading  (identical to web_demo.py)
 # ---------------------------------------------------------------------------
 
+def _load_config(config_path):
+    """Load YAML config file. Returns empty dict if path is None or missing."""
+    if not config_path or not os.path.isfile(config_path):
+        return {}
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f) or {}
+
+
 def _load_model_processor(args):
+    config = _load_config(getattr(args, 'config', None))
+
     from vllm import AsyncLLMEngine, AsyncEngineArgs
     engine_args = AsyncEngineArgs(
         model=args.checkpoint_path,
         trust_remote_code=True,
-        gpu_memory_utilization=0.66,
+        gpu_memory_utilization=0.8,
         tensor_parallel_size=torch.cuda.device_count(),
         limit_mm_per_prompt={'image': 1, 'video': 5, 'audio': 10},
         max_num_seqs=1,
-        max_model_len=32768,
+        max_model_len=65535,
         seed=1234,
     )
     model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
+
+    # Override max audio duration from config (default: 300s = 5 min)
+    audio_cfg = config.get('audio', {})
+    max_audio_sec = audio_cfg.get('max_audio_duration_sec', None)
+    if max_audio_sec is not None:
+        max_audio_sec = int(max_audio_sec)
+        fe = processor.feature_extractor
+        fe.n_samples = max_audio_sec * fe.sampling_rate
+        fe.nb_max_frames = fe.n_samples // fe.hop_length
+        print(f"[*] Audio max duration overridden to {max_audio_sec}s "
+              f"(n_samples={fe.n_samples}, nb_max_frames={fe.nb_max_frames})")
+
     return model, processor
 
 
@@ -1460,6 +1483,11 @@ def _get_args():
         "-c", "--checkpoint-path",
         default=DEFAULT_CKPT_PATH,
         help="Model checkpoint path (default: %(default)r)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to YAML config file (e.g. mm_llm_config.yaml) for runtime overrides",
     )
     parser.add_argument(
         "--host", default="127.0.0.1",
