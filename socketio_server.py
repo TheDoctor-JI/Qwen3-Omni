@@ -200,6 +200,7 @@ async def _stream_generate(sio, sid, model, processor, payload):
         top_p=top_p,
         top_k=top_k,
         max_tokens=max_tokens,
+        stop=["<|im_end|>", "<|im_start|>"],
     )
 
     try:
