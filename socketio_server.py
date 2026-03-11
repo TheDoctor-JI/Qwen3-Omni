@@ -234,10 +234,10 @@ def _prepare_inputs(processor, payload):
             add_generation_prompt=True,
             enable_thinking=thinking_mode,
         )
-        _logger.info(
-            f"[{request_id}] apply_chat_template succeeded with enable_thinking={thinking_mode}. "
-            f"Full prompt ({len(prompt_text)} chars):\n{prompt_text}"
-        )
+        # _logger.info(
+        #     f"[{request_id}] apply_chat_template succeeded with enable_thinking={thinking_mode}. "
+        #     f"Full prompt ({len(prompt_text)} chars):\n{prompt_text}"
+        # )
     except TypeError:
         _logger.warning(
             f"[{request_id}] apply_chat_template does not support enable_thinking; "
@@ -255,6 +255,10 @@ def _prepare_inputs(processor, payload):
         _logger.info(
             f"[{request_id}] force_thinking is ON — appended '<think>\\n' to prompt"
         )
+
+    _logger.debug(
+        f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
+    )
 
     audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
     inputs = {
