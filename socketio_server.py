@@ -1614,7 +1614,7 @@ if __name__ == "__main__":
     _logger_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'logger')
     sys.path.insert(0, os.path.dirname(_logger_dir))
     from logger.logger import setup_logger as _setup_logger
-    _logger = _setup_logger('socketio_server')
+    _logger = _setup_logger('socketio_server', file_log_level='DEBUG', terminal_log_level='INFO')
     sys.path.pop(0)
 
     _logger.info(f"Loading model from: {args.checkpoint_path}")
