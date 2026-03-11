@@ -51,8 +51,10 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 import uuid
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import yaml
@@ -71,6 +73,78 @@ from transformers import Qwen3OmniMoeProcessor
 
 
 DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
+
+# Set during _load_model_processor; guards how many *new* (uncached) mm items
+# a single request may introduce.
+_MAX_NEW_MM_PER_REQUEST: int = 20
+
+
+# ---------------------------------------------------------------------------
+# Per-session multimodal encoding cache
+# ---------------------------------------------------------------------------
+
+class MmItemCache:
+    """Caches the output of ``process_mm_info`` per (item_id, meta_key).
+
+    Thread-safe: a global lock protects the two dicts, and a per-item lock
+    prevents two threads from encoding the same unseen item concurrently.
+    """
+
+    def __init__(self) -> None:
+        self._cache: Dict[Tuple[str, str], Any] = {}
+        self._item_locks: Dict[str, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def meta_key_for(item: dict) -> str:
+        """Derive a metadata fingerprint from an annotated content item."""
+        dur = item.get('duration_ms', '?')
+        sr = item.get('sample_rate', '?')
+        return f"{dur}ms_{sr}hz"
+
+    def get(self, item_id: str, meta_key: str) -> Optional[Any]:
+        """Return the cached encoding or None."""
+        with self._lock:
+            return self._cache.get((item_id, meta_key))
+
+    def get_or_encode(
+        self,
+        item_id: str,
+        meta_key: str,
+        encode_fn: Callable[[], Any],
+    ) -> Tuple[Any, bool]:
+        """Return ``(encoded_result, is_new)``.
+
+        If the item is already cached, returns it immediately.  Otherwise
+        acquires a per-item lock (so concurrent callers for the *same*
+        unseen item wait instead of double-encoding), runs *encode_fn*,
+        stores the result, and returns it.
+        """
+        # Fast path — already cached
+        with self._lock:
+            cached = self._cache.get((item_id, meta_key))
+            if cached is not None:
+                return cached, False
+            # Get or create per-item lock
+            if item_id not in self._item_locks:
+                self._item_locks[item_id] = threading.Lock()
+            item_lock = self._item_locks[item_id]
+
+        # Slow path — hold per-item lock, double-check, then encode
+        with item_lock:
+            with self._lock:
+                cached = self._cache.get((item_id, meta_key))
+                if cached is not None:
+                    return cached, False
+            result = encode_fn()
+            with self._lock:
+                self._cache[(item_id, meta_key)] = result
+            return result, True
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
 
 # ---------------------------------------------------------------------------
 # Model loading  (identical to web_demo.py)
@@ -94,6 +168,10 @@ def _load_model_processor(args):
     limit_video = int(model_cfg.get('limit_video_per_prompt', 5))
 
     from vllm import AsyncLLMEngine, AsyncEngineArgs
+    enable_prefix_cache = bool(model_cfg.get('enable_prefix_caching', False))
+    max_new_mm = int(model_cfg.get('max_new_mm_per_request', 20))
+    global _MAX_NEW_MM_PER_REQUEST
+    _MAX_NEW_MM_PER_REQUEST = max_new_mm
     engine_args = AsyncEngineArgs(
         model=args.checkpoint_path,
         trust_remote_code=True,
@@ -103,10 +181,12 @@ def _load_model_processor(args):
         max_num_seqs=max_num_seqs,
         max_model_len=65535,
         seed=1234,
+        enable_prefix_caching=enable_prefix_cache,
     )
     _logger.info(
         f"max_num_seqs={max_num_seqs}, "
-        f"limit_mm_per_prompt={{image:{limit_image}, video:{limit_video}, audio:{limit_audio}}}"
+        f"limit_mm_per_prompt={{image:{limit_image}, video:{limit_video}, audio:{limit_audio}}}, "
+        f"enable_prefix_caching={enable_prefix_cache}, max_new_mm_per_request={max_new_mm}"
     )
     model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
@@ -176,7 +256,12 @@ def _build_messages(payload):
                 suffix = item.get("suffix") or default_suffixes[item_type]
                 path = _save_temp_b64(item["data"], suffix)
                 temp_files.append(path)
-                out_content.append({"type": item_type, item_type: path})
+                out_item = {"type": item_type, item_type: path}
+                # Copy through cache annotation fields if present
+                for ann_key in ('item_id', 'duration_ms', 'sample_rate'):
+                    if ann_key in item:
+                        out_item[ann_key] = item[ann_key]
+                out_content.append(out_item)
 
             elif item_type in default_suffixes and item.get(item_type):
                 # Already a file path (e.g. local testing) — pass through
@@ -196,10 +281,116 @@ def _build_messages(payload):
 
 
 # ---------------------------------------------------------------------------
+# Cache-aware multimodal encoding
+# ---------------------------------------------------------------------------
+
+_MM_MODALITIES = {"audio", "image", "video"}
+
+
+def _encode_single_mm_item(item_type: str, file_path: str):
+    """Run ``process_mm_info`` for a single media item and return the result.
+
+    Wraps the item in a synthetic one-message list so that the existing
+    ``process_mm_info`` machinery can process it.  Returns the first element
+    of the corresponding modality list (audio / image / video), or ``None``
+    if processing yields nothing.
+    """
+    synthetic_msg = [{"role": "user", "content": [{"type": item_type, item_type: file_path}]}]
+    audios, images, videos = process_mm_info(synthetic_msg, use_audio_in_video=True)
+    result_map = {"audio": audios, "image": images, "video": videos}
+    result_list = result_map.get(item_type)
+    if result_list is not None and len(result_list) > 0:
+        return result_list[0]
+    return None
+
+
+def _process_mm_info_cached(
+    messages: List[dict],
+    session_cache: Optional[MmItemCache],
+    request_id: str = '?',
+) -> Tuple[Optional[list], Optional[list], Optional[list], int]:
+    """Cache-aware replacement for ``process_mm_info``.
+
+    Iterates content items in left-to-right message order (preserving the
+    placeholder sequence that ``apply_chat_template`` expects).  For each
+    audio / image / video item:
+
+    * If the item carries an ``item_id`` and a *session_cache* is provided,
+      attempt a cache lookup before encoding.
+    * Otherwise fall back to ``_encode_single_mm_item``.
+
+    Returns ``(audios, images, videos, n_new)`` where *n_new* counts the
+    items that triggered a fresh ``process_mm_info`` call.
+    """
+    audios: List[Any] = []
+    images: List[Any] = []
+    videos: List[Any] = []
+    n_new = 0
+    n_hit = 0
+
+    for msg in messages:
+        for item in msg.get("content") or []:
+            item_type = item.get("type")
+            if item_type not in _MM_MODALITIES:
+                continue
+            file_path = item.get(item_type)
+            if not file_path:
+                continue
+
+            item_id = item.get("item_id")
+            meta_key = MmItemCache.meta_key_for(item) if item_id else None
+
+            encoded = None
+            is_new = True
+
+            if session_cache is not None and item_id is not None:
+                encoded, is_new = session_cache.get_or_encode(
+                    item_id, meta_key,
+                    lambda fp=file_path, it=item_type: _encode_single_mm_item(it, fp),
+                )
+            else:
+                encoded = _encode_single_mm_item(item_type, file_path)
+
+            if encoded is None:
+                _logger.warning(
+                    f"[{request_id}] Encoding returned None for {item_type} "
+                    f"item_id={item_id}"
+                )
+                continue
+
+            if is_new:
+                n_new += 1
+                _logger.debug(
+                    f"[{request_id}][CACHE MISS] {item_type} item_id={item_id} "
+                    f"meta={meta_key} — encoded fresh"
+                )
+            else:
+                n_hit += 1
+                _logger.debug(
+                    f"[{request_id}][CACHE HIT] {item_type} item_id={item_id} "
+                    f"meta={meta_key}"
+                )
+
+            {"audio": audios, "image": images, "video": videos}[item_type].append(encoded)
+
+    _logger.info(
+        f"[{request_id}] MM encoding: {n_hit} cache hits, {n_new} new encodings "
+        f"(audio={len(audios)}, image={len(images)}, video={len(videos)})"
+    )
+
+    return (
+        audios if audios else None,
+        images if images else None,
+        videos if videos else None,
+        n_new,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Preprocessing (synchronous — run in a thread to keep the event loop free)
 # ---------------------------------------------------------------------------
 
-def _prepare_inputs(processor, payload):
+def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = None):
     """Build vLLM inputs from a Socket.IO payload.
 
     This function is intentionally synchronous: apply_chat_template,
@@ -256,7 +447,15 @@ def _prepare_inputs(processor, payload):
         f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
     )
 
-    audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
+    audios, images, videos, n_new = _process_mm_info_cached(
+        messages, session_cache, request_id,
+    )
+    if n_new > _MAX_NEW_MM_PER_REQUEST:
+        raise ValueError(
+            f"Too many new multimodal items to encode in a single request: "
+            f"{n_new} > limit {_MAX_NEW_MM_PER_REQUEST}. "
+            f"Consider reducing context window size."
+        )
     inputs = {
         "prompt": prompt_text,
         "multi_modal_data": {},
@@ -273,7 +472,8 @@ def _prepare_inputs(processor, payload):
 # Core streaming generation coroutine
 # ---------------------------------------------------------------------------
 
-async def _stream_generate(sio, sid, model, processor, payload):
+async def _stream_generate(sio, sid, model, processor, payload,
+                           session_cache: Optional[MmItemCache] = None):
     request_id = payload.get('request_id') or str(uuid.uuid4())
     p = payload.get('params') or {}
     thinking_mode = bool(p.get('thinking_mode', True))
@@ -283,7 +483,7 @@ async def _stream_generate(sio, sid, model, processor, payload):
     # audio/image feature extraction) to a worker thread so the event
     # loop stays responsive for new connections and other events.
     inputs, sampling_params, temp_files = await asyncio.to_thread(
-        _prepare_inputs, processor, payload
+        _prepare_inputs, processor, payload, session_cache
     )
 
     await sio.emit("generation_start", {"request_id": request_id}, to=sid)
@@ -385,6 +585,7 @@ def create_socketio_app(model, processor):
     sio.attach(app)
 
     _active = {}   # sid -> (asyncio.Task, request_id: str)
+    _session_caches: Dict[str, MmItemCache] = {}  # sid -> per-session encoding cache
 
     async def _abort_active(sid, reason: str):
         """Cancel the active task for *sid* and abort the vLLM request.
@@ -409,11 +610,15 @@ def create_socketio_app(model, processor):
     @sio.on("connect")
     async def on_connect(sid, environ):
         _logger.info(f"connect    sid={sid}")
+        _session_caches[sid] = MmItemCache()
         await sio.emit("server_ready", {"sid": sid}, to=sid)
 
     @sio.on("disconnect")
     async def on_disconnect(sid):
         _logger.info(f"disconnect sid={sid}")
+        cache = _session_caches.pop(sid, None)
+        if cache is not None:
+            _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
         await _abort_active(sid, "disconnect")
 
     @sio.on("generate")
@@ -424,7 +629,8 @@ def create_socketio_app(model, processor):
         # Inject the resolved request_id back so _stream_generate uses it
         payload['request_id'] = request_id
         task = asyncio.create_task(
-            _stream_generate(sio, sid, model, processor, payload)
+            _stream_generate(sio, sid, model, processor, payload,
+                             session_cache=_session_caches.get(sid))
         )
         _active[sid] = (task, request_id)
 
