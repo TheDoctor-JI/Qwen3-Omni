@@ -22,7 +22,7 @@ Socket.IO protocol
   Client → Server events:
     "generate"  { messages: [{role, content: [{type, ...}]}],
                   params:{temperature,top_p,top_k,
-                  max_tokens,thinking_mode},
+                  max_tokens,thinking_mode,force_thinking},
                   request_id? }   — request_id is optional; server generates one if absent
     "stop"      { request_id? }  — cancel the running generation
 
@@ -204,16 +204,17 @@ def _prepare_inputs(processor, payload):
     from vllm import SamplingParams
 
     p = payload.get("params") or {}
-    temperature   = float(p.get("temperature",  0.7))
-    top_p         = float(p.get("top_p",        0.95))
-    top_k         = int  (p.get("top_k",        20))
-    max_tokens    = int  (p.get("max_tokens",   16384))
-    thinking_mode = bool (p.get("thinking_mode", True))
+    temperature    = float(p.get("temperature",  0.7))
+    top_p          = float(p.get("top_p",        0.95))
+    top_k          = int  (p.get("top_k",        20))
+    max_tokens     = int  (p.get("max_tokens",   16384))
+    thinking_mode  = bool (p.get("thinking_mode", True))
+    force_thinking = bool (p.get("force_thinking", False))
 
     request_id = payload.get('request_id', '?')
     _logger.info(
         f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, "
-        f"max_tokens={max_tokens}, temperature={temperature}"
+        f"force_thinking={force_thinking}, max_tokens={max_tokens}, temperature={temperature}"
     )
 
     messages, temp_files = _build_messages(payload)
@@ -244,6 +245,15 @@ def _prepare_inputs(processor, payload):
         )
         prompt_text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
+        )
+
+    # Force thinking: append <think>\n to nudge the model into a reasoning block.
+    # Only takes effect when enable_thinking is already true (so the template
+    # did NOT pre-fill an empty </think> block to suppress reasoning).
+    if thinking_mode and force_thinking:
+        prompt_text += '<think>\n'
+        _logger.info(
+            f"[{request_id}] force_thinking is ON — appended '<think>\\n' to prompt"
         )
 
     audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
