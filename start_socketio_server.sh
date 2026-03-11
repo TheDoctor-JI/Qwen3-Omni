@@ -16,8 +16,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 CONFIG_PATH="../AudioLLMInterface/MultiModalLLM/mm_llm_config.yaml"
 # If you want to switch checkpoints, edit the line below rather than
 # placing a commented argument inside the continued command.
-# Model not finetuned for thinking
 # --checkpoint-path ./Qwen3-Omni-30B-A3B-Instruct \
+# --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \
 
 python socketio_server.py \
     --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \
