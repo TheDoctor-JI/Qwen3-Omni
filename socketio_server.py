@@ -449,15 +449,18 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     process_mm_info, and base64-decoding are all CPU-bound and would block
     the asyncio event loop.  Callers should schedule it via
     ``asyncio.to_thread``.
+
+    Returns:
+        (inputs, sampling_params, temp_files, confirmed_items)
     """
     from vllm import SamplingParams
 
     p = payload.get("params") or {}
-    temperature    = float(p.get("temperature",  0.7))
-    top_p          = float(p.get("top_p",        0.95))
-    top_k          = int  (p.get("top_k",        20))
-    max_tokens     = int  (p.get("max_tokens",   16384))
-    thinking_mode  = bool (p.get("thinking_mode", True))
+    temperature   = float(p.get("temperature",  0.7))
+    top_p         = float(p.get("top_p",        0.95))
+    top_k         = int  (p.get("top_k",        20))
+    max_tokens    = int  (p.get("max_tokens",   16384))
+    thinking_mode = bool (p.get("thinking_mode", True))
 
     request_id = payload.get('request_id', '?')
     _logger.info(
@@ -466,6 +469,46 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     )
 
     messages, temp_files = _build_messages(payload)
+    _logger.info(
+        f"[{request_id}] _build_messages parsed {len(messages)} messages, "
+        f"{len(temp_files)} temp files"
+    )
+
+    audios, images, videos, n_new, confirmed = _process_mm_info_cached(
+        messages, session_cache, request_id,
+    )
+    _logger.info(
+        f"[{request_id}] _process_mm_info_cached: "
+        f"audios={len(audios) if audios else 0}, "
+        f"images={len(images) if images else 0}, "
+        f"videos={len(videos) if videos else 0}, "
+        f"n_new={n_new}, confirmed={len(confirmed)}"
+    )
+    if n_new > _MAX_NEW_MM_PER_REQUEST:
+        raise ValueError(
+            f"Too many new multimodal items to encode in a single request: "
+            f"{n_new} > limit {_MAX_NEW_MM_PER_REQUEST}. "
+            f"Consider reducing context window size."
+        )
+
+    prompt_text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=thinking_mode,
+    )
+
+    thinking_prefix = p.get('thinking_prefix', '') or ''
+    if thinking_prefix:
+        prompt_text += thinking_prefix
+        _logger.debug(
+            f"[{request_id}] Appended thinking_prefix "
+            f"({len(thinking_prefix)} chars) to prompt"
+        )
+
+    _logger.debug(
+        f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
+    )
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -475,39 +518,6 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         stop=["<|im_end|>", "<|im_start|>"],
     )
 
-    try:
-        prompt_text = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=thinking_mode,
-        )
-        # _logger.info(
-        #     f"[{request_id}] apply_chat_template succeeded with enable_thinking={thinking_mode}. "
-        #     f"Full prompt ({len(prompt_text)} chars):\n{prompt_text}"
-        # )
-    except TypeError:
-        _logger.warning(
-            f"[{request_id}] apply_chat_template does not support enable_thinking; "
-            "falling back without thinking injection."
-        )
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-
-    _logger.debug(
-        f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
-    )
-
-    audios, images, videos, n_new, _confirmed = _process_mm_info_cached(
-        messages, session_cache, request_id,
-    )
-    if n_new > _MAX_NEW_MM_PER_REQUEST:
-        raise ValueError(
-            f"Too many new multimodal items to encode in a single request: "
-            f"{n_new} > limit {_MAX_NEW_MM_PER_REQUEST}. "
-            f"Consider reducing context window size."
-        )
     inputs = {
         "prompt": prompt_text,
         "multi_modal_data": {},
@@ -517,7 +527,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     if videos is not None: inputs["multi_modal_data"]["video"] = videos
     if audios is not None: inputs["multi_modal_data"]["audio"] = audios
 
-    return inputs, sampling_params, temp_files
+    return inputs, sampling_params, temp_files, confirmed
 
 
 # ---------------------------------------------------------------------------
@@ -536,49 +546,16 @@ async def _stream_generate(sio, sid, model, processor, payload,
     # Offload blocking preprocessing (base64 decode, tokenization,
     # audio/image feature extraction) to a worker thread so the event
     # loop stays responsive for new connections and other events.
-    confirmed_items_holder: List[dict] = []
-
-    def debug_prepare_inputs():
-      messages, temp_files = _build_messages(payload)
-      _logger.info(f"[{request_id}] _build_messages parsed {len(messages)} messages, {len(temp_files)} temp files")
-      audios, images, videos, n_new, confirmed = _process_mm_info_cached(messages, session_cache, request_id)
-      confirmed_items_holder.extend(confirmed)
-      _logger.info(f"[{request_id}] _process_mm_info_cached: audios={len(audios) if audios else 0}, images={len(images) if images else 0}, videos={len(videos) if videos else 0}, n_new={n_new}, confirmed={len(confirmed)}")
-      # Rebuild inputs as usual
-      from vllm import SamplingParams
-      prompt_text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=thinking_mode,
-      )
-      sampling_params = SamplingParams(
-        temperature=float(p.get("temperature", 0.7)),
-        top_p=float(p.get("top_p", 0.95)),
-        top_k=int(p.get("top_k", 20)),
-        max_tokens=int(p.get("max_tokens", 16384)),
-        stop=["<|im_end|>", "<|im_start|>"],
-      )
-      inputs = {
-        "prompt": prompt_text,
-        "multi_modal_data": {},
-        "mm_processor_kwargs": {"use_audio_in_video": True},
-      }
-      if images is not None: inputs["multi_modal_data"]["image"] = images
-      if videos is not None: inputs["multi_modal_data"]["video"] = videos
-      if audios is not None: inputs["multi_modal_data"]["audio"] = audios
-      return inputs, sampling_params, temp_files
-
-    inputs, sampling_params, temp_files = await asyncio.to_thread(
-      debug_prepare_inputs
+    inputs, sampling_params, temp_files, confirmed_items = await asyncio.to_thread(
+        _prepare_inputs, processor, payload, session_cache,
     )
 
     # Notify client which items are confirmed in the encoding cache.
     # Emitted before generation_start so the client has acks before tokens.
-    if confirmed_items_holder:
+    if confirmed_items:
         await sio.emit("items_cached", {
             "request_id": request_id,
-            "items": confirmed_items_holder,
+            "items": confirmed_items,
         }, to=sid)
 
     await sio.emit("generation_start", {"request_id": request_id}, to=sid)
