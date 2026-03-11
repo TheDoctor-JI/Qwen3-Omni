@@ -28,6 +28,10 @@ Socket.IO protocol
 
   Server → Client events:
     "server_ready"         { sid }
+    "items_cached"         { request_id, items: [{item_id, meta_key}] }
+                           — emitted after preprocessing, before generation_start.
+                             Lists every MM item confirmed in the server-side
+                             encoding cache (both newly encoded and cache hits).
     "generation_start"     { request_id }
     "token"                { request_id, delta, full_text, num_tokens,
                              elapsed, ttft, finished }
@@ -40,6 +44,10 @@ Message format (inside "messages"):
     Each message is {role: str, content: [{type, ...}]}.
     Text items:  {type: "text", text: "..."}
     Audio items: {type: "audio", data: "<base64>", suffix: ".wav"}
+    Audio stub:  {type: "audio", item_id: "...", duration_ms: N, sample_rate: N}
+                 — lightweight reference for items the client believes are
+                   already in the server's encoding cache. No "data" key.
+                   Server looks up the cached encoding; raises ValueError on miss.
     Image items: {type: "image", data: "<base64>", suffix: ".jpg"}
     Video items: {type: "video", data: "<base64>", suffix: ".mp4"}
     Roles: "system", "user", "assistant", "tool"
@@ -263,6 +271,15 @@ def _build_messages(payload):
                         out_item[ann_key] = item[ann_key]
                 out_content.append(out_item)
 
+            elif item_type == "audio" and item.get("item_id") and not item.get("data"):
+                # Stub reference — client believes this item is already cached.
+                # Pass through annotation fields only; no temp file created.
+                out_item = {"type": "audio", "item_id": item["item_id"]}
+                for ann_key in ('duration_ms', 'sample_rate'):
+                    if ann_key in item:
+                        out_item[ann_key] = item[ann_key]
+                out_content.append(out_item)
+
             elif item_type in default_suffixes and item.get(item_type):
                 # Already a file path (e.g. local testing) — pass through
                 out_content.append(item)
@@ -308,37 +325,66 @@ def _process_mm_info_cached(
     messages: List[dict],
     session_cache: Optional[MmItemCache],
     request_id: str = '?',
-) -> Tuple[Optional[list], Optional[list], Optional[list], int]:
+) -> Tuple[Optional[list], Optional[list], Optional[list], int, List[dict]]:
     """Cache-aware replacement for ``process_mm_info``.
 
     Iterates content items in left-to-right message order (preserving the
     placeholder sequence that ``apply_chat_template`` expects).  For each
     audio / image / video item:
 
-    * If the item carries an ``item_id`` and a *session_cache* is provided,
-      attempt a cache lookup before encoding.
+    * **Stub reference** (``item_id`` present but no file path): look up
+      directly in *session_cache*; raise ``ValueError`` on miss.
+    * **Full item** with ``item_id`` and *session_cache*: use
+      ``get_or_encode`` for cache-or-encode.
     * Otherwise fall back to ``_encode_single_mm_item``.
 
-    Returns ``(audios, images, videos, n_new)`` where *n_new* counts the
-    items that triggered a fresh ``process_mm_info`` call.
+    Returns ``(audios, images, videos, n_new, confirmed_items)`` where
+    *n_new* counts fresh encodings and *confirmed_items* lists
+    ``{item_id, meta_key}`` dicts for every item successfully resolved
+    from (or stored into) the cache.
     """
     audios: List[Any] = []
     images: List[Any] = []
     videos: List[Any] = []
     n_new = 0
     n_hit = 0
+    n_stub_hit = 0
+    confirmed_items: List[dict] = []
 
     for msg in messages:
         for item in msg.get("content") or []:
             item_type = item.get("type")
             if item_type not in _MM_MODALITIES:
                 continue
-            file_path = item.get(item_type)
-            if not file_path:
-                continue
 
             item_id = item.get("item_id")
             meta_key = MmItemCache.meta_key_for(item) if item_id else None
+            file_path = item.get(item_type)
+
+            # --- Stub reference: no file_path, client expects cache hit ---
+            if not file_path and item_id is not None and session_cache is not None:
+                encoded = session_cache.get(item_id, meta_key)
+                if encoded is None:
+                    _logger.warning(
+                        f"[{request_id}][STUB MISS] {item_type} item_id={item_id} "
+                        f"meta={meta_key} — client desynced"
+                    )
+                    raise ValueError(
+                        f"Stub cache miss for {item_type} item_id={item_id} "
+                        f"meta={meta_key} — item not in server cache"
+                    )
+                n_stub_hit += 1
+                _logger.debug(
+                    f"[{request_id}][CACHE HIT stub] {item_type} item_id={item_id} "
+                    f"meta={meta_key}"
+                )
+                confirmed_items.append({'item_id': item_id, 'meta_key': meta_key})
+                {"audio": audios, "image": images, "video": videos}[item_type].append(encoded)
+                continue
+
+            # --- Full item with file_path ---
+            if not file_path:
+                continue
 
             encoded = None
             is_new = True
@@ -371,10 +417,15 @@ def _process_mm_info_cached(
                     f"meta={meta_key}"
                 )
 
+            # Track confirmed cache entry (both newly stored and existing hits)
+            if item_id is not None and meta_key is not None:
+                confirmed_items.append({'item_id': item_id, 'meta_key': meta_key})
+
             {"audio": audios, "image": images, "video": videos}[item_type].append(encoded)
 
     _logger.info(
-        f"[{request_id}] MM encoding: {n_hit} cache hits, {n_new} new encodings "
+        f"[{request_id}] MM encoding: {n_stub_hit} stub hits, {n_hit} full hits, "
+        f"{n_new} new encodings "
         f"(audio={len(audios)}, image={len(images)}, video={len(videos)})"
     )
 
@@ -383,6 +434,7 @@ def _process_mm_info_cached(
         images if images else None,
         videos if videos else None,
         n_new,
+        confirmed_items,
     )
 
 
@@ -447,7 +499,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
     )
 
-    audios, images, videos, n_new = _process_mm_info_cached(
+    audios, images, videos, n_new, _confirmed = _process_mm_info_cached(
         messages, session_cache, request_id,
     )
     if n_new > _MAX_NEW_MM_PER_REQUEST:
@@ -484,11 +536,14 @@ async def _stream_generate(sio, sid, model, processor, payload,
     # Offload blocking preprocessing (base64 decode, tokenization,
     # audio/image feature extraction) to a worker thread so the event
     # loop stays responsive for new connections and other events.
+    confirmed_items_holder: List[dict] = []
+
     def debug_prepare_inputs():
       messages, temp_files = _build_messages(payload)
       _logger.info(f"[{request_id}] _build_messages parsed {len(messages)} messages, {len(temp_files)} temp files")
-      audios, images, videos, n_new = _process_mm_info_cached(messages, session_cache, request_id)
-      _logger.info(f"[{request_id}] _process_mm_info_cached: audios={len(audios) if audios else 0}, images={len(images) if images else 0}, videos={len(videos) if videos else 0}, n_new={n_new}")
+      audios, images, videos, n_new, confirmed = _process_mm_info_cached(messages, session_cache, request_id)
+      confirmed_items_holder.extend(confirmed)
+      _logger.info(f"[{request_id}] _process_mm_info_cached: audios={len(audios) if audios else 0}, images={len(images) if images else 0}, videos={len(videos) if videos else 0}, n_new={n_new}, confirmed={len(confirmed)}")
       # Rebuild inputs as usual
       from vllm import SamplingParams
       prompt_text = processor.apply_chat_template(
@@ -517,6 +572,14 @@ async def _stream_generate(sio, sid, model, processor, payload,
     inputs, sampling_params, temp_files = await asyncio.to_thread(
       debug_prepare_inputs
     )
+
+    # Notify client which items are confirmed in the encoding cache.
+    # Emitted before generation_start so the client has acks before tokens.
+    if confirmed_items_holder:
+        await sio.emit("items_cached", {
+            "request_id": request_id,
+            "items": confirmed_items_holder,
+        }, to=sid)
 
     await sio.emit("generation_start", {"request_id": request_id}, to=sid)
 
