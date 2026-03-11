@@ -47,13 +47,18 @@ Message format (inside "messages"):
 
 import asyncio
 import base64
+import logging
 import os
+import sys
 import tempfile
 import time
 import uuid
 
 import torch
 import yaml
+
+# Module-level logger — replaced with a file-backed logger in __main__
+_logger = logging.getLogger('socketio_server')
 
 os.environ['VLLM_USE_V1'] = '0'
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
@@ -96,7 +101,7 @@ def _load_model_processor(args):
         max_model_len=65535,
         seed=1234,
     )
-    print(f"[*] max_num_seqs = {max_num_seqs}")
+    _logger.info(f"max_num_seqs = {max_num_seqs}")
     model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
 
@@ -108,8 +113,10 @@ def _load_model_processor(args):
         fe = processor.feature_extractor
         fe.n_samples = max_audio_sec * fe.sampling_rate
         fe.nb_max_frames = fe.n_samples // fe.hop_length
-        print(f"[*] Audio max duration overridden to {max_audio_sec}s "
-              f"(n_samples={fe.n_samples}, nb_max_frames={fe.nb_max_frames})")
+        _logger.info(
+            f"Audio max duration overridden to {max_audio_sec}s "
+            f"(n_samples={fe.n_samples}, nb_max_frames={fe.nb_max_frames})"
+        )
 
     return model, processor
 
@@ -203,6 +210,12 @@ def _prepare_inputs(processor, payload):
     max_tokens    = int  (p.get("max_tokens",   16384))
     thinking_mode = bool (p.get("thinking_mode", True))
 
+    request_id = payload.get('request_id', '?')
+    _logger.info(
+        f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, "
+        f"max_tokens={max_tokens}, temperature={temperature}"
+    )
+
     messages, temp_files = _build_messages(payload)
 
     sampling_params = SamplingParams(
@@ -220,7 +233,15 @@ def _prepare_inputs(processor, payload):
             add_generation_prompt=True,
             enable_thinking=thinking_mode,
         )
+        _logger.info(
+            f"[{request_id}] apply_chat_template succeeded with enable_thinking={thinking_mode}. "
+            f"Full prompt ({len(prompt_text)} chars):\n{prompt_text}"
+        )
     except TypeError:
+        _logger.warning(
+            f"[{request_id}] apply_chat_template does not support enable_thinking; "
+            "falling back without thinking injection."
+        )
         prompt_text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
@@ -244,6 +265,9 @@ def _prepare_inputs(processor, payload):
 
 async def _stream_generate(sio, sid, model, processor, payload):
     request_id = payload.get('request_id') or str(uuid.uuid4())
+    p = payload.get('params') or {}
+    thinking_mode = bool(p.get('thinking_mode', True))
+    _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}")
 
     # Offload blocking preprocessing (base64 decode, tokenization,
     # audio/image feature extraction) to a worker thread so the event
@@ -254,10 +278,12 @@ async def _stream_generate(sio, sid, model, processor, payload):
 
     await sio.emit("generation_start", {"request_id": request_id}, to=sid)
 
-    t_start   = time.perf_counter()
-    prev_text = ""
-    n_tokens  = 0
-    ttft      = None
+    t_start      = time.perf_counter()
+    prev_text    = ""
+    n_tokens     = 0
+    ttft         = None
+    _think_started = False
+    _think_ended   = False
 
     try:
         async for output in model.generate(inputs, sampling_params, request_id):
@@ -267,7 +293,20 @@ async def _stream_generate(sio, sid, model, processor, payload):
                 elapsed = time.perf_counter() - t_start
                 if ttft is None:
                     ttft = elapsed
+                    _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
                 n_tokens += 1
+
+                # Detect thinking block transitions and log them
+                if not _think_started and '<think>' in full_text:
+                    _think_started = True
+                    _logger.info(f"[{request_id}] Thinking block STARTED — model is reasoning")
+                if _think_started and not _think_ended and '</think>' in full_text:
+                    _think_ended = True
+                    think_chars = full_text.find('</think>') - full_text.find('<think>') - 7
+                    _logger.info(
+                        f"[{request_id}] Thinking block ENDED (~{think_chars} chars of reasoning)"
+                    )
+
                 await sio.emit("token", {
                     "request_id": request_id,
                     "delta":      delta,
@@ -281,6 +320,16 @@ async def _stream_generate(sio, sid, model, processor, payload):
 
         total_time = time.perf_counter() - t_start
         tps = n_tokens / total_time if total_time > 0 else 0.0
+        if _think_started:
+            _logger.info(
+                f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps, "
+                f"thinking={'complete' if _think_ended else 'block did not close'}"
+            )
+        else:
+            _logger.info(
+                f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps — "
+                "no <think> block detected (thinking_mode=False or model skipped reasoning)"
+            )
         await sio.emit("generation_complete", {
             "request_id":        request_id,
             "full_text":         prev_text,
@@ -291,12 +340,14 @@ async def _stream_generate(sio, sid, model, processor, payload):
         }, to=sid)
 
     except asyncio.CancelledError:
+        _logger.info(f"[{request_id}] Generation cancelled (stopped by client)")
         await sio.emit("generation_stopped", {
             "request_id":  request_id,
             "partial_text": prev_text,
         }, to=sid)
 
     except Exception as exc:
+        _logger.error(f"[{request_id}] Generation error: {exc}", exc_info=True)
         await sio.emit("generation_error", {
             "request_id": request_id,
             "error":      str(exc),
@@ -341,18 +392,18 @@ def create_socketio_app(model, processor):
             try:
                 await model.abort(req_id)
             except Exception as e:
-                print(f"[!] model.abort({req_id}) failed ({reason}): {e}")
+                _logger.warning(f"model.abort({req_id}) failed ({reason}): {e}")
             task.cancel()
-            print(f"[x] {reason}: cancelled task for {sid} (request_id={req_id})")
+            _logger.info(f"{reason}: cancelled task for sid={sid} (request_id={req_id})")
 
     @sio.on("connect")
     async def on_connect(sid, environ):
-        print(f"[+] connect    {sid}")
+        _logger.info(f"connect    sid={sid}")
         await sio.emit("server_ready", {"sid": sid}, to=sid)
 
     @sio.on("disconnect")
     async def on_disconnect(sid):
-        print(f"[-] disconnect {sid}")
+        _logger.info(f"disconnect sid={sid}")
         await _abort_active(sid, "disconnect")
 
     @sio.on("generate")
@@ -1544,9 +1595,17 @@ def _get_args():
 
 if __name__ == "__main__":
     args = _get_args()
-    print(f"[*] Loading model from: {args.checkpoint_path}")
+
+    # Set up the file-backed logger (writes to logger/logs/socketio_server/)
+    _logger_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'logger')
+    sys.path.insert(0, os.path.dirname(_logger_dir))
+    from logger.logger import setup_logger as _setup_logger
+    _logger = _setup_logger('socketio_server')
+    sys.path.pop(0)
+
+    _logger.info(f"Loading model from: {args.checkpoint_path}")
     model, processor = _load_model_processor(args)
-    print(f"[*] Model loaded. Serving GUI + Socket.IO on http://{args.host}:{args.port}")
+    _logger.info(f"Model loaded. Serving GUI + Socket.IO on http://{args.host}:{args.port}")
     app = create_socketio_app(model, processor)
     # Suppress the default "Running on ..." banner from aiohttp
     web.run_app(app, host=args.host, port=args.port, print=lambda _: None)
