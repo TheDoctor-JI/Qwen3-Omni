@@ -25,7 +25,7 @@ Usage:
 import argparse
 import base64
 import io
-import struct
+import os
 import sys
 import threading
 import time
@@ -33,39 +33,43 @@ import wave
 
 import socketio
 
+# ---------------------------------------------------------------------------
+# Reuse the same audio helpers as the production mm_llm_client_session.
+# wrap_pcm_as_wav creates a WAV from raw PCM in exactly the same way that
+# the real pipeline (_encode_pcm_as_b64_wav) does — single writeframes call.
+# ---------------------------------------------------------------------------
+_AUDIO_HELPERS_DIR = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)),
+    '..', 'AudioLLMInterface', 'utils',
+)
+sys.path.insert(0, _AUDIO_HELPERS_DIR)
+from audio_helpers import wrap_pcm_as_wav
+sys.path.remove(_AUDIO_HELPERS_DIR)
+
 
 # ---------------------------------------------------------------------------
 # Audio synthesis helpers
 # ---------------------------------------------------------------------------
 
-def _synthesise_silence_wav(duration_sec: float, sample_rate: int = 16000) -> bytes:
-    """Return a WAV file (bytes) containing *duration_sec* of silence at 16-bit mono."""
+def _synthesise_pcm_silence(duration_sec: float, sample_rate: int = 16000) -> bytes:
+    """Return raw PCM s16le silence bytes (mono, 16-bit) — same format the
+    production pipeline stores in ContextItem.audio_bytes."""
     n_samples = int(duration_sec * sample_rate)
-    buf = io.BytesIO()
-    with wave.open(buf, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(sample_rate)
-        # Write in 1-second chunks to avoid huge single allocation
-        chunk_samples = sample_rate
-        written = 0
-        while written < n_samples:
-            batch = min(chunk_samples, n_samples - written)
-            wf.writeframes(b'\x00\x00' * batch)
-            written += batch
-    return buf.getvalue()
+    return b'\x00\x00' * n_samples
 
 
-def _wav_to_b64(wav_bytes: bytes) -> str:
+def _encode_pcm_as_b64_wav(pcm_bytes: bytes, sample_rate: int) -> str:
+    """Mirrors MultiModalLLMSession._encode_pcm_as_b64_wav exactly."""
+    wav_bytes = wrap_pcm_as_wav(pcm_bytes, sample_rate)
     return base64.b64encode(wav_bytes).decode('ascii')
 
 
-def _make_audio_content_item(wav_bytes: bytes, item_id: str,
+def _make_audio_content_item(pcm_bytes: bytes, item_id: str,
                              duration_ms: int, sample_rate: int = 16000) -> dict:
-    """Build a single audio content item with cache annotations."""
+    """Build an audio content item identical to _serialize_user_item."""
     return {
         'type': 'audio',
-        'data': _wav_to_b64(wav_bytes),
+        'data': _encode_pcm_as_b64_wav(pcm_bytes, sample_rate),
         'suffix': '.wav',
         'item_id': item_id,
         'duration_ms': duration_ms,
@@ -186,13 +190,13 @@ def test_single(host: str, port: int, duration_sec: float):
     print(f"TEST 1: Single {duration_sec/60:.0f}-minute audio file")
     print(f"{'='*70}")
 
-    print(f"  Synthesising {duration_sec}s of silence (16 kHz, 16-bit mono) ...")
+    print(f"  Synthesising {duration_sec}s of PCM silence (16 kHz, 16-bit mono) ...")
     t0 = time.time()
-    wav_bytes = _synthesise_silence_wav(duration_sec)
-    print(f"  Synthesised {len(wav_bytes)/1024/1024:.1f} MB in {time.time()-t0:.1f}s")
+    pcm_bytes = _synthesise_pcm_silence(duration_sec)
+    print(f"  Synthesised {len(pcm_bytes)/1024/1024:.1f} MB PCM in {time.time()-t0:.1f}s")
 
     item = _make_audio_content_item(
-        wav_bytes, item_id='single_60min', duration_ms=int(duration_sec * 1000),
+        pcm_bytes, item_id='single_60min', duration_ms=int(duration_sec * 1000),
     )
 
     messages = [
@@ -229,13 +233,13 @@ def test_chunked(host: str, port: int, duration_sec: float, num_chunks: int):
     chunk_duration = duration_sec / num_chunks
     print(f"  Chunk duration: {chunk_duration:.1f}s each")
 
-    # Pre-synthesise all chunks
-    print(f"  Synthesising {num_chunks} chunks ...")
+    # Pre-synthesise all chunks as raw PCM
+    print(f"  Synthesising {num_chunks} PCM chunks ...")
     chunks = []
     for i in range(num_chunks):
-        wav = _synthesise_silence_wav(chunk_duration)
+        pcm = _synthesise_pcm_silence(chunk_duration)
         chunks.append({
-            'wav': wav,
+            'pcm': pcm,
             'item_id': f'chunk_{i:03d}',
             'duration_ms': int(chunk_duration * 1000),
         })
@@ -254,7 +258,7 @@ def test_chunked(host: str, port: int, duration_sec: float, num_chunks: int):
             content = []
             for c in active_chunks:
                 content.append(_make_audio_content_item(
-                    c['wav'], item_id=c['item_id'], duration_ms=c['duration_ms'],
+                    c['pcm'], item_id=c['item_id'], duration_ms=c['duration_ms'],
                 ))
             content.append({'type': 'text', 'text': f'Round {round_idx}: summarise.'})
 
@@ -289,13 +293,13 @@ def test_concurrent(host: str, port: int, num_threads: int):
     print(f"{'='*70}")
 
     # Synthesise a shared audio clip (5s is enough for the test)
-    shared_wav = _synthesise_silence_wav(5.0)
+    shared_pcm = _synthesise_pcm_silence(5.0)
     shared_item = _make_audio_content_item(
-        shared_wav, item_id='shared_concurrent_item', duration_ms=5000,
+        shared_pcm, item_id='shared_concurrent_item', duration_ms=5000,
     )
 
     # Each thread also has a unique item
-    unique_wavs = [_synthesise_silence_wav(2.0) for _ in range(num_threads)]
+    unique_pcms = [_synthesise_pcm_silence(2.0) for _ in range(num_threads)]
 
     # All threads share ONE Socket.IO connection (same session = same cache)
     sio = _connect(host, port)
@@ -305,7 +309,7 @@ def test_concurrent(host: str, port: int, num_threads: int):
 
     def _worker(idx):
         unique_item = _make_audio_content_item(
-            unique_wavs[idx],
+            unique_pcms[idx],
             item_id=f'unique_{idx}',
             duration_ms=2000,
         )
