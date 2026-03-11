@@ -474,16 +474,48 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
 
 async def _stream_generate(sio, sid, model, processor, payload,
                            session_cache: Optional[MmItemCache] = None):
+
     request_id = payload.get('request_id') or str(uuid.uuid4())
     p = payload.get('params') or {}
     thinking_mode = bool(p.get('thinking_mode', True))
     _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}")
+    # _logger.debug(f"[{request_id}] Incoming payload: {payload}")
 
     # Offload blocking preprocessing (base64 decode, tokenization,
     # audio/image feature extraction) to a worker thread so the event
     # loop stays responsive for new connections and other events.
+    def debug_prepare_inputs():
+      messages, temp_files = _build_messages(payload)
+      _logger.info(f"[{request_id}] _build_messages parsed {len(messages)} messages, {len(temp_files)} temp files")
+      audios, images, videos, n_new = _process_mm_info_cached(messages, session_cache, request_id)
+      _logger.info(f"[{request_id}] _process_mm_info_cached: audios={len(audios) if audios else 0}, images={len(images) if images else 0}, videos={len(videos) if videos else 0}, n_new={n_new}")
+      # Rebuild inputs as usual
+      from vllm import SamplingParams
+      prompt_text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=thinking_mode,
+      )
+      sampling_params = SamplingParams(
+        temperature=float(p.get("temperature", 0.7)),
+        top_p=float(p.get("top_p", 0.95)),
+        top_k=int(p.get("top_k", 20)),
+        max_tokens=int(p.get("max_tokens", 16384)),
+        stop=["<|im_end|>", "<|im_start|>"],
+      )
+      inputs = {
+        "prompt": prompt_text,
+        "multi_modal_data": {},
+        "mm_processor_kwargs": {"use_audio_in_video": True},
+      }
+      if images is not None: inputs["multi_modal_data"]["image"] = images
+      if videos is not None: inputs["multi_modal_data"]["video"] = videos
+      if audios is not None: inputs["multi_modal_data"]["audio"] = audios
+      return inputs, sampling_params, temp_files
+
     inputs, sampling_params, temp_files = await asyncio.to_thread(
-        _prepare_inputs, processor, payload, session_cache
+      debug_prepare_inputs
     )
 
     await sio.emit("generation_start", {"request_id": request_id}, to=sid)
@@ -579,7 +611,7 @@ def create_socketio_app(model, processor):
     sio = socketio.AsyncServer(
         async_mode="aiohttp",
         cors_allowed_origins="*",
-        max_http_buffer_size=100 * 1024 * 1024,   # 100 MB – enough for audio/video
+        max_http_buffer_size=200 * 1024 * 1024,   # 200 MB – enough for audio/video
     )
     app = web.Application()
     sio.attach(app)
