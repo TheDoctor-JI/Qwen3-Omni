@@ -89,6 +89,9 @@ def _load_model_processor(args):
 
     model_cfg = config.get('model', {})
     max_num_seqs = int(model_cfg.get('max_num_seqs', 2))
+    limit_audio = int(model_cfg.get('limit_audio_per_prompt', 10))
+    limit_image = int(model_cfg.get('limit_image_per_prompt', 1))
+    limit_video = int(model_cfg.get('limit_video_per_prompt', 5))
 
     from vllm import AsyncLLMEngine, AsyncEngineArgs
     engine_args = AsyncEngineArgs(
@@ -96,12 +99,15 @@ def _load_model_processor(args):
         trust_remote_code=True,
         gpu_memory_utilization=0.8,
         tensor_parallel_size=torch.cuda.device_count(),
-        limit_mm_per_prompt={'image': 1, 'video': 5, 'audio': 10},
+        limit_mm_per_prompt={'image': limit_image, 'video': limit_video, 'audio': limit_audio},
         max_num_seqs=max_num_seqs,
         max_model_len=65535,
         seed=1234,
     )
-    _logger.info(f"max_num_seqs = {max_num_seqs}")
+    _logger.info(
+        f"max_num_seqs={max_num_seqs}, "
+        f"limit_mm_per_prompt={{image:{limit_image}, video:{limit_video}, audio:{limit_audio}}}"
+    )
     model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
 
