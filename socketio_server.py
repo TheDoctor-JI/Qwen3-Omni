@@ -34,12 +34,19 @@ Socket.IO protocol
                              encoding cache (both newly encoded and cache hits).
     "generation_start"     { request_id }
     "token"                { request_id, delta, full_text, num_tokens,
-                             elapsed, ttft, finished }
+                             elapsed, ttft, finished,
+                             [on finished=true only:
+                              total_time, tokens_per_second,
+                              generation_duration, generated_tokens,
+                              time_to_first_token] }
     "generation_complete"  { request_id, full_text, total_time,
                  num_tokens, tokens_per_second, ttft,
                  generation_duration, generated_tokens,
                  time_to_first_token }
-    "generation_stopped"   { request_id, partial_text }
+    "generation_stopped"   { request_id, partial_text,
+                 total_time, num_tokens, tokens_per_second, ttft,
+                 generation_duration, generated_tokens,
+                 time_to_first_token }
     "generation_error"     { request_id, error }
 
 Message format (inside "messages"):
@@ -591,7 +598,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                         f"[{request_id}] Thinking block ENDED (~{think_chars} chars of reasoning)"
                     )
 
-                await sio.emit("token", {
+                token_payload = {
                     "request_id": request_id,
                     "delta":      delta,
                     "full_text":  full_text,
@@ -599,7 +606,23 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "elapsed":    round(elapsed, 3),
                     "ttft":       round(ttft, 3),
                     "finished":   output.finished,
-                }, to=sid)
+                }
+
+                # Attach terminal efficiency stats on the final token event
+                # so clients that finalize on token.finished can still report
+                # complete metrics even if generation_complete arrives later.
+                if output.finished:
+                    total_time = elapsed
+                    tps = n_tokens / total_time if total_time > 0 else 0.0
+                    token_payload.update({
+                        "total_time":        round(total_time, 3),
+                        "tokens_per_second": round(tps, 1),
+                        "generation_duration": round(total_time, 3),
+                        "generated_tokens":    n_tokens,
+                        "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+                    })
+
+                await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
 
         total_time = time.perf_counter() - t_start
@@ -629,9 +652,19 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
     except asyncio.CancelledError:
         _logger.info(f"[{request_id}] Generation cancelled (stopped by client)")
+        total_time = time.perf_counter() - t_start
+        tps = n_tokens / total_time if total_time > 0 else 0.0
         await sio.emit("generation_stopped", {
             "request_id":  request_id,
             "partial_text": prev_text,
+            "total_time":        round(total_time, 3),
+            "num_tokens":        n_tokens,
+            "tokens_per_second": round(tps, 1),
+            "ttft":              round(ttft, 3) if ttft is not None else None,
+            # Explicit efficiency aliases for downstream consumers.
+            "generation_duration": round(total_time, 3),
+            "generated_tokens":    n_tokens,
+            "time_to_first_token": round(ttft, 3) if ttft is not None else None,
         }, to=sid)
 
     except Exception as exc:
@@ -1401,6 +1434,18 @@ function connect() {
 
   socket.on('generation_stopped', (d) => {
     finalizeAsst(d.partial_text || null);
+    if (d.num_tokens != null || d.generated_tokens != null) {
+      const nTok = d.generated_tokens ?? d.num_tokens;
+      const dur = d.generation_duration ?? d.total_time;
+      const ttft = d.time_to_first_token ?? d.ttft;
+      const tps = d.tokens_per_second;
+      setMetrics(
+        ttft != null ? ttft + 's' : '—',
+        nTok ?? '—',
+        tps != null ? (tps + ' t/s') : '—',
+        dur != null ? (dur + 's') : '—'
+      );
+    }
     setStatus('stopped');
     if (d.partial_text) history.push({ role: 'assistant', content: [{type: 'text', text: d.partial_text}] });
     setGenerating(false);
