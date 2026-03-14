@@ -36,7 +36,9 @@ Socket.IO protocol
     "token"                { request_id, delta, full_text, num_tokens,
                              elapsed, ttft, finished }
     "generation_complete"  { request_id, full_text, total_time,
-                             num_tokens, tokens_per_second, ttft }
+                 num_tokens, tokens_per_second, ttft,
+                 generation_duration, generated_tokens,
+                 time_to_first_token }
     "generation_stopped"   { request_id, partial_text }
     "generation_error"     { request_id, error }
 
@@ -619,6 +621,10 @@ async def _stream_generate(sio, sid, model, processor, payload,
             "num_tokens":        n_tokens,
             "tokens_per_second": round(tps, 1),
             "ttft":              round(ttft, 3) if ttft is not None else None,
+          # Explicit efficiency aliases for downstream consumers.
+          "generation_duration": round(total_time, 3),
+          "generated_tokens":    n_tokens,
+          "time_to_first_token": round(ttft, 3) if ttft is not None else None,
         }, to=sid)
 
     except asyncio.CancelledError:
