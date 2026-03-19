@@ -175,8 +175,13 @@ def _load_config(config_path):
         return yaml.safe_load(f) or {}
 
 
+# Global config mapping
+SERVER_CONFIG = {}
+
 def _load_model_processor(args):
+    global SERVER_CONFIG
     config = _load_config(getattr(args, 'config', None))
+    SERVER_CONFIG = config
 
     model_cfg = config.get('model', {})
     max_num_seqs = int(model_cfg.get('max_num_seqs', 2))
@@ -470,10 +475,11 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     top_k         = int  (p.get("top_k",        20))
     max_tokens    = int  (p.get("max_tokens",   16384))
     thinking_mode = bool (p.get("thinking_mode", True))
+    prime_thinking= bool (p.get("prime_thinking", False))
 
     request_id = payload.get('request_id', '?')
     _logger.info(
-        f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, "
+        f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, prime_thinking={prime_thinking}, "
         f"max_tokens={max_tokens}, temperature={temperature}"
     )
 
@@ -514,6 +520,11 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
             f"[{request_id}] Appended thinking_prefix "
             f"({len(thinking_prefix)} chars) to prompt"
         )
+        
+    if thinking_mode and prime_thinking:
+        open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
+        prompt_text += open_tag + "\n"
+        _logger.debug(f"[{request_id}] Primed prompt with {open_tag}\\n")
 
     _logger.debug(
         f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
@@ -549,8 +560,12 @@ async def _stream_generate(sio, sid, model, processor, payload,
     request_id = payload.get('request_id') or str(uuid.uuid4())
     p = payload.get('params') or {}
     thinking_mode = bool(p.get('thinking_mode', True))
-    _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}")
+    prime_thinking = bool(p.get('prime_thinking', False))
+    _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}, prime_thinking={prime_thinking}")
     # _logger.debug(f"[{request_id}] Incoming payload: {payload}")
+    
+    open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
+    close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
 
     # Offload blocking preprocessing (base64 decode, tokenization,
     # audio/image feature extraction) to a worker thread so the event
@@ -579,6 +594,9 @@ async def _stream_generate(sio, sid, model, processor, payload,
     try:
         async for output in model.generate(inputs, sampling_params, request_id):
             full_text = output.outputs[0].text
+            if thinking_mode and prime_thinking:
+                full_text = open_tag + "\n" + full_text
+            
             delta = full_text[len(prev_text):]
             if delta:
                 elapsed = time.perf_counter() - t_start
@@ -588,12 +606,12 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 n_tokens += 1
 
                 # Detect thinking block transitions and log them
-                if not _think_started and '<think>' in full_text:
+                if not _think_started and open_tag in full_text:
                     _think_started = True
                     _logger.info(f"[{request_id}] Thinking block STARTED — model is reasoning")
-                if _think_started and not _think_ended and '</think>' in full_text:
+                if _think_started and not _think_ended and close_tag in full_text:
                     _think_ended = True
-                    think_chars = full_text.find('</think>') - full_text.find('<think>') - 7
+                    think_chars = full_text.find(close_tag) - full_text.find(open_tag) - len(open_tag)
                     _logger.info(
                         f"[{request_id}] Thinking block ENDED (~{think_chars} chars of reasoning)"
                     )
@@ -635,7 +653,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
         else:
             _logger.info(
                 f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps — "
-                "no <think> block detected (thinking_mode=False or model skipped reasoning)"
+                f"no {open_tag} block detected (thinking_mode=False or model skipped reasoning)"
             )
         await sio.emit("generation_complete", {
             "request_id":        request_id,
