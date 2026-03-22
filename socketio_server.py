@@ -95,6 +95,9 @@ DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
 # a single request may introduce.
 _MAX_NEW_MM_PER_REQUEST: int = 20
 
+# Set during _load_model_processor; used to gate thinking-mode behavior.
+_MODEL_IS_INSTRUCT: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Per-session multimodal encoding cache
@@ -183,6 +186,10 @@ def _load_model_processor(args):
     config = _load_config(getattr(args, 'config', None))
     SERVER_CONFIG = config
 
+    global _MODEL_IS_INSTRUCT
+    ckpt_lower = str(args.checkpoint_path).lower()
+    _MODEL_IS_INSTRUCT = 'instruct' in ckpt_lower
+
     model_cfg = config.get('model', {})
     max_num_seqs = int(model_cfg.get('max_num_seqs', 2))
     limit_audio = int(model_cfg.get('limit_audio_per_prompt', 10))
@@ -209,6 +216,10 @@ def _load_model_processor(args):
         f"max_num_seqs={max_num_seqs}, "
         f"limit_mm_per_prompt={{image:{limit_image}, video:{limit_video}, audio:{limit_audio}}}, "
         f"enable_prefix_caching={enable_prefix_cache}, max_new_mm_per_request={max_new_mm}"
+    )
+    _logger.info(
+        f"Model profile detected: {'instruct' if _MODEL_IS_INSTRUCT else 'thinking/other'} "
+        f"(checkpoint={args.checkpoint_path})"
     )
     model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
@@ -483,6 +494,14 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         f"max_tokens={max_tokens}, temperature={temperature}"
     )
 
+    template_enable_thinking = thinking_mode
+    if _MODEL_IS_INSTRUCT and not thinking_mode:
+        _logger.warning(
+            f"[{request_id}] enable thinking is not active for instruct model; "
+            f"ignoring thinking_mode=False and proceeding without think-tag suppression"
+        )
+        template_enable_thinking = True
+
     messages, temp_files = _build_messages(payload)
     _logger.info(
         f"[{request_id}] _build_messages parsed {len(messages)} messages, "
@@ -510,7 +529,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=thinking_mode,
+        enable_thinking=template_enable_thinking,
     )
 
     thinking_prefix = p.get('thinking_prefix', '') or ''
