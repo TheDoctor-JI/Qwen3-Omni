@@ -34,20 +34,26 @@ Socket.IO protocol
                              encoding cache (both newly encoded and cache hits).
     "generation_start"     { request_id }
     "token"                { request_id, delta, full_text, num_tokens,
-                             elapsed, ttft, finished,
+           elapsed, ttft, finished,
                              [on finished=true only:
-                              total_time, tokens_per_second,
+                  full_generation_latency_sec, tokens_per_second,
                               generation_duration, generated_tokens,
                               time_to_first_token] }
-    "generation_complete"  { request_id, full_text, total_time,
+    "generation_complete"  { request_id, full_text, full_generation_latency_sec,
                  num_tokens, tokens_per_second, ttft,
                  generation_duration, generated_tokens,
                  time_to_first_token }
     "generation_stopped"   { request_id, partial_text,
-                 total_time, num_tokens, tokens_per_second, ttft,
+           full_generation_latency_sec, num_tokens, tokens_per_second, ttft,
                  generation_duration, generated_tokens,
                  time_to_first_token }
     "generation_error"     { request_id, error }
+
+  Timing semantics:
+    ttft / time_to_first_token = time from generation trigger to first token.
+    generation_duration = time from first token to generation end.
+    full_generation_latency_sec = ttft + generation_duration (when ttft is available).
+    legacy total_time is emitted for backward compatibility.
 
 Message format (inside "messages"):
     Each message is {role: str, content: [{type, ...}]}.
@@ -685,9 +691,11 @@ async def _stream_generate(sio, sid, model, processor, payload,
             if thinking_mode and prime_thinking and text_for_count.startswith(open_tag + "\n"):
                 text_for_count = text_for_count[len(open_tag) + 1:]
 
+            prev_n_tokens = n_tokens
             n_tokens = _count_generated_tokens(processor, text_for_count, output_item)
             elapsed = time.perf_counter() - t_start
-            if ttft is None and n_tokens > 0:
+            # TTFT is anchored to the first observed generated token.
+            if ttft is None and n_tokens > prev_n_tokens:
                 ttft = elapsed
                 _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
             
@@ -720,22 +728,26 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 # so clients that finalize on token.finished can still report
                 # complete metrics even if generation_complete arrives later.
                 if output.finished:
-                    total_time = elapsed
-                    tps = n_tokens / total_time if total_time > 0 else 0.0
-                    token_payload.update({
-                        "total_time":        round(total_time, 3),
-                        "tokens_per_second": round(tps, 1),
-                        "generation_duration": round(total_time, 3),
-                        "generated_tokens":    n_tokens,
-                        "time_to_first_token": round(ttft, 3) if ttft is not None else None,
-                        "input_text_tokens": input_text_tokens,
-                        "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
-                    })
+                  total_time = elapsed
+                  post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
+                  tps = n_tokens / total_time if total_time > 0 else 0.0
+                  token_payload.update({
+                  "full_generation_latency_sec": round(total_time, 3),
+                  "total_time": round(total_time, 3),  # legacy alias
+                    "tokens_per_second": round(tps, 1),
+                    # generation_duration is post-first-token generation time.
+                    "generation_duration": round(post_ttft_duration, 3),
+                    "generated_tokens": n_tokens,
+                    "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+                    "input_text_tokens": input_text_tokens,
+                    "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+                  })
 
                 await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
 
         total_time = time.perf_counter() - t_start
+        post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
         tps = n_tokens / total_time if total_time > 0 else 0.0
         if _think_started:
             _logger.info(
@@ -750,12 +762,14 @@ async def _stream_generate(sio, sid, model, processor, payload,
         await sio.emit("generation_complete", {
             "request_id":        request_id,
             "full_text":         prev_text,
-            "total_time":        round(total_time,  3),
+          "full_generation_latency_sec": round(total_time, 3),
+          "total_time":        round(total_time,  3),  # legacy alias
             "num_tokens":        n_tokens,
             "tokens_per_second": round(tps, 1),
             "ttft":              round(ttft, 3) if ttft is not None else None,
           # Explicit efficiency aliases for downstream consumers.
-          "generation_duration": round(total_time, 3),
+          # generation_duration is post-first-token generation time.
+          "generation_duration": round(post_ttft_duration, 3),
           "generated_tokens":    n_tokens,
           "time_to_first_token": round(ttft, 3) if ttft is not None else None,
           "input_text_tokens":   input_text_tokens,
@@ -765,16 +779,19 @@ async def _stream_generate(sio, sid, model, processor, payload,
     except asyncio.CancelledError:
         _logger.info(f"[{request_id}] Generation cancelled (stopped by client)")
         total_time = time.perf_counter() - t_start
+        post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
         tps = n_tokens / total_time if total_time > 0 else 0.0
         await sio.emit("generation_stopped", {
             "request_id":  request_id,
             "partial_text": prev_text,
-            "total_time":        round(total_time, 3),
+          "full_generation_latency_sec": round(total_time, 3),
+          "total_time":        round(total_time, 3),  # legacy alias
             "num_tokens":        n_tokens,
             "tokens_per_second": round(tps, 1),
             "ttft":              round(ttft, 3) if ttft is not None else None,
             # Explicit efficiency aliases for downstream consumers.
-            "generation_duration": round(total_time, 3),
+          # generation_duration is post-first-token generation time.
+          "generation_duration": round(post_ttft_duration, 3),
             "generated_tokens":    n_tokens,
             "time_to_first_token": round(ttft, 3) if ttft is not None else None,
             "input_text_tokens":   input_text_tokens,
@@ -1449,7 +1466,7 @@ details[open].think-details summary::before { transform: rotate(90deg); }
       <span>TTFT&nbsp;<span class="mv" id="m-ttft">—</span></span>
       <span>Tokens&nbsp;<span class="mv" id="m-tokens">—</span></span>
       <span>TPS&nbsp;<span class="mv" id="m-tps">—</span></span>
-      <span>Total&nbsp;<span class="mv" id="m-total">—</span></span>
+      <span>Full Latency&nbsp;<span class="mv" id="m-total">—</span></span>
       <div id="gen-status">
         <div class="spinner" id="spinner"></div>
         <span id="status-text"></span>
@@ -1535,11 +1552,12 @@ function connect() {
 
   socket.on('generation_complete', (d) => {
     finalizeAsst(d.full_text);
+    const fullLatency = d.full_generation_latency_sec ?? d.total_time;
     setMetrics(
       d.ttft != null ? d.ttft + 's' : '—',
       d.num_tokens,
       d.tokens_per_second + ' t/s',
-      d.total_time + 's'
+      fullLatency != null ? (fullLatency + 's') : '—'
     );
     setStatus('done');
     history.push({ role: 'assistant', content: [{type: 'text', text: d.full_text}] });
@@ -1550,14 +1568,14 @@ function connect() {
     finalizeAsst(d.partial_text || null);
     if (d.num_tokens != null || d.generated_tokens != null) {
       const nTok = d.generated_tokens ?? d.num_tokens;
-      const dur = d.generation_duration ?? d.total_time;
+      const fullLatency = d.full_generation_latency_sec ?? d.total_time;
       const ttft = d.time_to_first_token ?? d.ttft;
       const tps = d.tokens_per_second;
       setMetrics(
         ttft != null ? ttft + 's' : '—',
         nTok ?? '—',
         tps != null ? (tps + ' t/s') : '—',
-        dur != null ? (dur + 's') : '—'
+        fullLatency != null ? (fullLatency + 's') : '—'
       );
     }
     setStatus('stopped');

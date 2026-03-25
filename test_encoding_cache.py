@@ -90,7 +90,7 @@ class GenerationResult:
         self.finished = threading.Event()
         self.started = threading.Event()
         self.ttft: float = None
-        self.total_time: float = None
+        self.full_generation_latency_sec: float = None
         self.num_tokens: int = 0
 
     def summary(self) -> str:
@@ -98,7 +98,7 @@ class GenerationResult:
             return f"ERROR: {self.error}"
         return (
             f"tokens={self.num_tokens}, ttft={self.ttft}s, "
-            f"total={self.total_time}s, "
+            f"full_latency={self.full_generation_latency_sec}s, "
             f"text={self.full_text[:120]!r}..."
         )
 
@@ -145,7 +145,7 @@ def _generate(sio: socketio.Client, messages: list, request_id: str,
     def _on_complete(data):
         if data.get('request_id') == request_id:
             result.full_text = data.get('full_text', '')
-            result.total_time = data.get('total_time')
+            result.full_generation_latency_sec = data.get('full_generation_latency_sec', data.get('total_time'))
             result.num_tokens = data.get('num_tokens', 0)
             result.ttft = data.get('ttft')
             result.finished.set()
