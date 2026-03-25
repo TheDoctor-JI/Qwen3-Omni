@@ -255,7 +255,7 @@ def _save_temp_b64(data_b64, suffix):
 
 def _build_messages(payload):
     """
-    Convert a socket payload into (messages_list, temp_file_paths).
+    Convert a socket payload into (messages_list, temp_file_paths, total_input_audio_duration_sec).
 
     The payload uses the messages-based protocol where every turn is a
     structured message with inline base64 media.  This function
@@ -267,8 +267,21 @@ def _build_messages(payload):
     """
     messages = []
     temp_files = []
+    total_input_audio_duration_sec = 0.0
 
     default_suffixes = {"audio": ".wav", "image": ".jpg", "video": ".mp4"}
+
+    def _accumulate_audio_duration(item_obj: dict, item_type: str):
+        nonlocal total_input_audio_duration_sec
+        if item_type != "audio":
+            return
+        raw_ms = item_obj.get("duration_ms")
+        if raw_ms is None:
+            return
+        try:
+            total_input_audio_duration_sec += float(raw_ms) / 1000.0
+        except Exception:
+            pass
 
     for msg in payload.get("messages") or []:
         role = msg.get("role", "user")
@@ -295,6 +308,7 @@ def _build_messages(payload):
                     if ann_key in item:
                         out_item[ann_key] = item[ann_key]
                 out_content.append(out_item)
+                _accumulate_audio_duration(item, item_type)
 
             elif item_type == "audio" and item.get("item_id") and not item.get("data"):
                 # Stub reference — client believes this item is already cached.
@@ -304,10 +318,12 @@ def _build_messages(payload):
                     if ann_key in item:
                         out_item[ann_key] = item[ann_key]
                 out_content.append(out_item)
+                _accumulate_audio_duration(item, item_type)
 
             elif item_type in default_suffixes and item.get(item_type):
                 # Already a file path (e.g. local testing) — pass through
                 out_content.append(item)
+                _accumulate_audio_duration(item, item_type)
 
             elif item_type == "text":
                 out_content.append({"type": "text", "text": item.get("text", "")})
@@ -319,7 +335,35 @@ def _build_messages(payload):
         if out_content:
             messages.append({"role": role, "content": out_content})
 
-    return messages, temp_files
+    return messages, temp_files, total_input_audio_duration_sec
+
+
+def _count_text_tokens(processor, text: str) -> int:
+    """Count text tokens with the model tokenizer."""
+    if not text:
+        return 0
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return 0
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    except TypeError:
+        # Some tokenizers may not accept add_special_tokens.
+        return len(tokenizer.encode(text))
+    except Exception:
+        return 0
+
+
+def _count_generated_tokens(processor, generated_text: str, request_output_item) -> int:
+    """Count generated output tokens.
+
+    Prefer native token IDs from vLLM outputs when available, and fall back
+    to tokenizer-based counting of the current generated text.
+    """
+    token_ids = getattr(request_output_item, "token_ids", None)
+    if isinstance(token_ids, (list, tuple)):
+        return len(token_ids)
+    return _count_text_tokens(processor, generated_text)
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +520,8 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     ``asyncio.to_thread``.
 
     Returns:
-        (inputs, sampling_params, temp_files, confirmed_items)
+      (inputs, sampling_params, temp_files, confirmed_items,
+       input_text_tokens, input_audio_duration_sec)
     """
     from vllm import SamplingParams
 
@@ -502,7 +547,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         )
         template_enable_thinking = True
 
-    messages, temp_files = _build_messages(payload)
+    messages, temp_files, input_audio_duration_sec = _build_messages(payload)
     _logger.info(
         f"[{request_id}] _build_messages parsed {len(messages)} messages, "
         f"{len(temp_files)} temp files"
@@ -548,6 +593,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     _logger.debug(
         f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
     )
+    input_text_tokens = _count_text_tokens(processor, prompt_text)
 
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -566,7 +612,14 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     if videos is not None: inputs["multi_modal_data"]["video"] = videos
     if audios is not None: inputs["multi_modal_data"]["audio"] = audios
 
-    return inputs, sampling_params, temp_files, confirmed
+    return (
+      inputs,
+      sampling_params,
+      temp_files,
+      confirmed,
+      input_text_tokens,
+      input_audio_duration_sec,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +642,14 @@ async def _stream_generate(sio, sid, model, processor, payload,
     # Offload blocking preprocessing (base64 decode, tokenization,
     # audio/image feature extraction) to a worker thread so the event
     # loop stays responsive for new connections and other events.
-    inputs, sampling_params, temp_files, confirmed_items = await asyncio.to_thread(
+    (
+      inputs,
+      sampling_params,
+      temp_files,
+      confirmed_items,
+      input_text_tokens,
+      input_audio_duration_sec,
+    ) = await asyncio.to_thread(
         _prepare_inputs, processor, payload, session_cache,
     )
 
@@ -601,7 +661,11 @@ async def _stream_generate(sio, sid, model, processor, payload,
             "items": confirmed_items,
         }, to=sid)
 
-    await sio.emit("generation_start", {"request_id": request_id}, to=sid)
+    await sio.emit("generation_start", {
+      "request_id": request_id,
+      "input_text_tokens": input_text_tokens,
+      "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+    }, to=sid)
 
     t_start      = time.perf_counter()
     prev_text    = ""
@@ -612,18 +676,23 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
     try:
         async for output in model.generate(inputs, sampling_params, request_id):
-            full_text = output.outputs[0].text
+            output_item = output.outputs[0] if output.outputs else None
+            full_text = output_item.text if output_item is not None else prev_text
             if thinking_mode and prime_thinking:
                 full_text = open_tag + "\n" + full_text
+
+            text_for_count = full_text
+            if thinking_mode and prime_thinking and text_for_count.startswith(open_tag + "\n"):
+                text_for_count = text_for_count[len(open_tag) + 1:]
+
+            n_tokens = _count_generated_tokens(processor, text_for_count, output_item)
+            elapsed = time.perf_counter() - t_start
+            if ttft is None and n_tokens > 0:
+                ttft = elapsed
+                _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
             
             delta = full_text[len(prev_text):]
             if delta:
-                elapsed = time.perf_counter() - t_start
-                if ttft is None:
-                    ttft = elapsed
-                    _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
-                n_tokens += 1
-
                 # Detect thinking block transitions and log them
                 if not _think_started and open_tag in full_text:
                     _think_started = True
@@ -643,6 +712,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "elapsed":    round(elapsed, 3),
                     "ttft":       round(ttft, 3),
                     "finished":   output.finished,
+                    "input_text_tokens": input_text_tokens,
+                    "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
                 }
 
                 # Attach terminal efficiency stats on the final token event
@@ -657,6 +728,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
                         "generation_duration": round(total_time, 3),
                         "generated_tokens":    n_tokens,
                         "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+                        "input_text_tokens": input_text_tokens,
+                        "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
                     })
 
                 await sio.emit("token", token_payload, to=sid)
@@ -685,6 +758,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
           "generation_duration": round(total_time, 3),
           "generated_tokens":    n_tokens,
           "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+          "input_text_tokens":   input_text_tokens,
+          "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
         }, to=sid)
 
     except asyncio.CancelledError:
@@ -702,6 +777,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
             "generation_duration": round(total_time, 3),
             "generated_tokens":    n_tokens,
             "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+            "input_text_tokens":   input_text_tokens,
+            "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
         }, to=sid)
 
     except Exception as exc:
