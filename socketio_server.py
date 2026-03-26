@@ -934,6 +934,23 @@ def create_socketio_app(model, processor):
         )
         await sio.emit("cache_cleared", to=sid)
 
+    @sio.on("reset_kv_cache")
+    async def on_reset_kv_cache(sid):
+        """Flush vLLM's prefix KV cache.
+
+        Calls AsyncLLMEngine.reset_prefix_cache(), which discards all cached
+        KV blocks so the next request runs with a cold cache.  Intended for
+        evaluation harnesses that need fair, order-independent TTFT comparisons.
+        Emits ``kv_cache_reset`` ack to the caller when complete.
+        """
+        _logger.info(f"reset_kv_cache: flushing prefix KV cache (triggered by sid={sid})")
+        try:
+            await model.reset_prefix_cache()
+            _logger.info(f"reset_kv_cache: prefix KV cache cleared (triggered by sid={sid})")
+        except Exception as e:
+            _logger.warning(f"reset_kv_cache: reset_prefix_cache() failed: {e}")
+        await sio.emit("kv_cache_reset", to=sid)
+
     async def handle_index(request):
         return web.Response(text=_GUI_HTML, content_type="text/html")
 
