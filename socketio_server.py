@@ -755,7 +755,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "generation_duration": round(post_ttft_duration, 3),
                     "generated_tokens": n_tokens,
                     "time_to_first_token": round(ttft, 3) if ttft is not None else None,
-                    "time_to_first_response_token": round(_t_first_response_token_final, 3) if _t_first_response_token_final is not None else None,
+                    "llm_time_to_first_response_token": round(_t_first_response_token_final, 3) if _t_first_response_token_final is not None else None,
                     "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
                     "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
                     "input_text_tokens": input_text_tokens,
@@ -796,7 +796,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
           "generation_duration": round(post_ttft_duration, 3),
           "generated_tokens":    n_tokens,
           "time_to_first_token": round(ttft, 3) if ttft is not None else None,
-          "time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+          "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
           "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
           "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
           "input_text_tokens":   input_text_tokens,
@@ -821,7 +821,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
           "generation_duration": round(post_ttft_duration, 3),
             "generated_tokens":    n_tokens,
             "time_to_first_token": round(ttft, 3) if ttft is not None else None,
-            "time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+            "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
             "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
             "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
             "input_text_tokens":   input_text_tokens,
@@ -858,6 +858,7 @@ def create_socketio_app(model, processor):
 
     _active = {}   # sid -> (asyncio.Task, request_id: str)
     _session_caches: Dict[str, MmItemCache] = {}  # sid -> per-session encoding cache
+    _connected_sids: set = set()  # sids with live connections; used by clear_cache to find stale entries
 
     async def _abort_active(sid, reason: str):
         """Cancel the active task for *sid* and abort the vLLM request.
@@ -882,12 +883,14 @@ def create_socketio_app(model, processor):
     @sio.on("connect")
     async def on_connect(sid, environ):
         _logger.info(f"connect    sid={sid}")
+        _connected_sids.add(sid)
         _session_caches[sid] = MmItemCache()
         await sio.emit("server_ready", {"sid": sid}, to=sid)
 
     @sio.on("disconnect")
     async def on_disconnect(sid):
         _logger.info(f"disconnect sid={sid}")
+        _connected_sids.discard(sid)
         cache = _session_caches.pop(sid, None)
         if cache is not None:
             _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
@@ -909,6 +912,27 @@ def create_socketio_app(model, processor):
     @sio.on("stop")
     async def on_stop(sid, payload=None):
         await _abort_active(sid, "stop")
+
+    @sio.on("clear_cache")
+    async def on_clear_cache(sid):
+        """Wipe cached state for all sessions that are no longer connected.
+
+        Safe to call from any live client.  Aborts any in-flight vLLM
+        requests belonging to stale sessions, releases their MmItemCache
+        entries, then emits a bare ``cache_cleared`` ack to the caller.
+        """
+        stale_sids = (set(_session_caches.keys()) | set(_active.keys())) - _connected_sids
+        for stale_sid in stale_sids:
+            cache = _session_caches.pop(stale_sid, None)
+            await _abort_active(stale_sid, "clear_cache")
+            _logger.info(
+                f"clear_cache: released sid={stale_sid} "
+                f"(cache entries: {len(cache) if cache is not None else 0})"
+            )
+        _logger.info(
+            f"clear_cache: swept {len(stale_sids)} stale session(s), triggered by sid={sid}"
+        )
+        await sio.emit("cache_cleared", to=sid)
 
     async def handle_index(request):
         return web.Response(text=_GUI_HTML, content_type="text/html")
