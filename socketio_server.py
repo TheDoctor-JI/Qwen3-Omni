@@ -677,6 +677,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
     prev_text    = ""
     n_tokens     = 0
     ttft         = None
+    _t_first_response_token = None
     _think_started = False
     _think_ended   = False
 
@@ -712,6 +713,18 @@ async def _stream_generate(sio, sid, model, processor, payload,
                         f"[{request_id}] Thinking block ENDED (~{think_chars} chars of reasoning)"
                     )
 
+                # Track first response token (non-thinking content).
+                # If no thinking block: equals ttft (set on first token).
+                # If thinking block present: set on first token after close_tag.
+                if _t_first_response_token is None:
+                    if not _think_started and ttft is not None:
+                        _t_first_response_token = ttft
+                    elif _think_ended:
+                        close_pos = full_text.find(close_tag)
+                        response_content = full_text[close_pos + len(close_tag):].strip()
+                        if response_content:
+                            _t_first_response_token = elapsed
+
                 token_payload = {
                     "request_id": request_id,
                     "delta":      delta,
@@ -731,6 +744,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                   total_time = elapsed
                   post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
                   tps = n_tokens / total_time if total_time > 0 else 0.0
+                  _t_first_response_token_final = _t_first_response_token if _t_first_response_token is not None else ttft
                   token_payload.update({
                   "full_generation_latency_sec": round(total_time, 3),
                   "total_time": round(total_time, 3),  # legacy alias
@@ -739,12 +753,18 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "generation_duration": round(post_ttft_duration, 3),
                     "generated_tokens": n_tokens,
                     "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+                    "time_to_first_response_token": round(_t_first_response_token_final, 3) if _t_first_response_token_final is not None else None,
                     "input_text_tokens": input_text_tokens,
                     "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
                   })
 
                 await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
+
+        # Fallback: if thinking never ended or no response content detected,
+        # time_to_first_response_token equals ttft.
+        if _t_first_response_token is None:
+            _t_first_response_token = ttft
 
         total_time = time.perf_counter() - t_start
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
@@ -772,6 +792,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
           "generation_duration": round(post_ttft_duration, 3),
           "generated_tokens":    n_tokens,
           "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+          "time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
           "input_text_tokens":   input_text_tokens,
           "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
         }, to=sid)
@@ -794,6 +815,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
           "generation_duration": round(post_ttft_duration, 3),
             "generated_tokens":    n_tokens,
             "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+            "time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
             "input_text_tokens":   input_text_tokens,
             "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
         }, to=sid)
