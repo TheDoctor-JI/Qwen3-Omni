@@ -680,6 +680,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
     _t_first_response_token = None
     _think_started = False
     _think_ended   = False
+    _t_think_end   = None   # elapsed when </think> was first detected
 
     try:
         async for output in model.generate(inputs, sampling_params, request_id):
@@ -708,6 +709,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     _logger.info(f"[{request_id}] Thinking block STARTED — model is reasoning")
                 if _think_started and not _think_ended and close_tag in full_text:
                     _think_ended = True
+                    _t_think_end = elapsed
                     think_chars = full_text.find(close_tag) - full_text.find(open_tag) - len(open_tag)
                     _logger.info(
                         f"[{request_id}] Thinking block ENDED (~{think_chars} chars of reasoning)"
@@ -754,6 +756,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "generated_tokens": n_tokens,
                     "time_to_first_token": round(ttft, 3) if ttft is not None else None,
                     "time_to_first_response_token": round(_t_first_response_token_final, 3) if _t_first_response_token_final is not None else None,
+                    "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
+                    "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
                     "input_text_tokens": input_text_tokens,
                     "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
                   })
@@ -793,6 +797,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
           "generated_tokens":    n_tokens,
           "time_to_first_token": round(ttft, 3) if ttft is not None else None,
           "time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+          "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
+          "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
           "input_text_tokens":   input_text_tokens,
           "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
         }, to=sid)
@@ -816,6 +822,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
             "generated_tokens":    n_tokens,
             "time_to_first_token": round(ttft, 3) if ttft is not None else None,
             "time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+            "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
+            "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
             "input_text_tokens":   input_text_tokens,
             "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
         }, to=sid)
