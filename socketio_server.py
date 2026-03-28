@@ -537,14 +537,35 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     top_k         = int  (p.get("top_k",        20))
     max_tokens    = int  (p.get("max_tokens",   16384))
     thinking_mode = bool (p.get("thinking_mode", True))
-    prime_thinking= bool (p.get("prime_thinking", False))
 
     request_id = payload.get('request_id', '?')
     _logger.info(
-        f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, prime_thinking={prime_thinking}, "
+        f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, "
         f"max_tokens={max_tokens}, temperature={temperature}"
     )
 
+    # ---------------------------------------------------------------------------
+    # Thinking-mode control via the official Jinja2 chat template
+    # ---------------------------------------------------------------------------
+    # ``thinking_mode`` maps directly to ``enable_thinking`` in
+    # ``processor.apply_chat_template``, which resolves to the model's own
+    # ``chat_template.json``.  No <think>/<think> tokens are manually injected
+    # here — the template handles everything:
+    #
+    #   enable_thinking=True  (default):
+    #       Template emits: <|im_start|>assistant\n
+    #       The model generates a <think>...</think> block naturally from
+    #       training before producing its response.
+    #
+    #   enable_thinking=False:
+    #       Template emits: <|im_start|>assistant\n<think>\n\n</think>\n\n
+    #       The already-closed empty think block acts as a prefill — the model
+    #       skips reasoning entirely and produces only the response.
+    #
+    # Guard: instruct model variants do not have the enable_thinking=False
+    # template path (they were not trained with the closed think-block prefix).
+    # _MODEL_IS_INSTRUCT overrides thinking_mode=False → True for those models.
+    # ---------------------------------------------------------------------------
     template_enable_thinking = thinking_mode
     if _MODEL_IS_INSTRUCT and not thinking_mode:
         _logger.warning(
@@ -582,19 +603,6 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         add_generation_prompt=True,
         enable_thinking=template_enable_thinking,
     )
-
-    thinking_prefix = p.get('thinking_prefix', '') or ''
-    if thinking_prefix:
-        prompt_text += thinking_prefix
-        _logger.debug(
-            f"[{request_id}] Appended thinking_prefix "
-            f"({len(thinking_prefix)} chars) to prompt"
-        )
-        
-    if thinking_mode and prime_thinking:
-        open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
-        prompt_text += open_tag + "\n"
-        _logger.debug(f"[{request_id}] Primed prompt with {open_tag}\\n")
 
     _logger.debug(
         f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
@@ -638,8 +646,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
     request_id = payload.get('request_id') or str(uuid.uuid4())
     p = payload.get('params') or {}
     thinking_mode = bool(p.get('thinking_mode', True))
-    prime_thinking = bool(p.get('prime_thinking', False))
-    _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}, prime_thinking={prime_thinking}")
+    _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}")
     # _logger.debug(f"[{request_id}] Incoming payload: {payload}")
     
     open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
@@ -686,15 +693,9 @@ async def _stream_generate(sio, sid, model, processor, payload,
         async for output in model.generate(inputs, sampling_params, request_id):
             output_item = output.outputs[0] if output.outputs else None
             full_text = output_item.text if output_item is not None else prev_text
-            if thinking_mode and prime_thinking:
-                full_text = open_tag + "\n" + full_text
-
-            text_for_count = full_text
-            if thinking_mode and prime_thinking and text_for_count.startswith(open_tag + "\n"):
-                text_for_count = text_for_count[len(open_tag) + 1:]
 
             prev_n_tokens = n_tokens
-            n_tokens = _count_generated_tokens(processor, text_for_count, output_item)
+            n_tokens = _count_generated_tokens(processor, full_text, output_item)
             elapsed = time.perf_counter() - t_start
             # TTFT is anchored to the first observed generated token.
             if ttft is None and n_tokens > prev_n_tokens:
