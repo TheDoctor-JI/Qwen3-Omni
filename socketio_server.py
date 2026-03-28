@@ -717,15 +717,22 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     )
 
                 # Track first response token (non-thinking content).
-                # If no thinking block: equals ttft (set on first token).
-                # If thinking block present: set on first token after close_tag.
+                # If no thinking block: set on first delta that is not a leading
+                #   prefix of open_tag (defers while "<", "<t", "<th"… are
+                #   assembling, so we don't lock in ttft before <think> is detected).
+                # If thinking block present: set on first response char after close_tag.
+                # Always use elapsed (current time) rather than the stale ttft value.
                 if _t_first_response_token is None:
-                    if not _think_started and ttft is not None:
-                        _t_first_response_token = ttft
-                    elif _think_ended:
+                    if _think_ended:
                         close_pos = full_text.find(close_tag)
                         response_content = full_text[close_pos + len(close_tag):].strip()
                         if response_content:
+                            _t_first_response_token = elapsed
+                    elif not _think_started:
+                        # Defer while full_text is still a leading prefix of open_tag
+                        # (e.g. "<", "<t", "<th"…) — the tag may still be assembling.
+                        partial = full_text.lstrip()
+                        if not (partial and open_tag.startswith(partial)):
                             _t_first_response_token = elapsed
 
                 token_payload = {
