@@ -597,10 +597,40 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
             f"Consider reducing context window size."
         )
 
+    # -----------------------------------------------------------------------
+    # Delta-thinking prefix support
+    # -----------------------------------------------------------------------
+    # When the client sends a non-empty ``thinking_prefix`` (raw text, no
+    # ``<think>`` tag), and the model is a thinking-capable model with
+    # thinking enabled, we:
+    #   1. Append a partial assistant message whose content opens a ``<think>``
+    #      block containing the prefix text.
+    #   2. Use ``continue_final_message=True`` + ``add_generation_prompt=False``
+    #      so the model continues generating inside the already-open think block.
+    #
+    # Guard: delta-thinking only activates when ALL of:
+    #   - thinking_prefix is non-empty
+    #   - thinking_mode is True (caller requested thinking)
+    #   - model is NOT instruct-only (instruct models lack think-tag support)
+    # -----------------------------------------------------------------------
+    thinking_prefix = str(p.get("thinking_prefix", "") or "")
+    _use_delta_thinking = bool(thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT)
+
+    if _use_delta_thinking:
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"<think>{thinking_prefix}"}],
+        })
+        _logger.info(
+            f"[{request_id}] Delta-thinking prefix injected "
+            f"({len(thinking_prefix)} chars); using continue_final_message=True"
+        )
+
     prompt_text = processor.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True,
+        add_generation_prompt=not _use_delta_thinking,
+        **(dict(continue_final_message=True) if _use_delta_thinking else {}),
         enable_thinking=template_enable_thinking,
     )
 
@@ -688,6 +718,14 @@ async def _stream_generate(sio, sid, model, processor, payload,
     _think_started = False
     _think_ended   = False
     _t_think_end   = None   # elapsed when </think> was first detected
+
+    # Delta-thinking prefix: if the client sent a non-empty thinking_prefix
+    # with thinking enabled on a thinking-capable model, generation starts
+    # inside an already-open <think> block.
+    _thinking_prefix = str(p.get('thinking_prefix', '') or '')
+    if _thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT:
+        _think_started = True
+        _logger.info(f"[{request_id}] Delta-thinking mode: _think_started pre-set to True")
 
     try:
         async for output in model.generate(inputs, sampling_params, request_id):
