@@ -617,13 +617,24 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     _use_delta_thinking = bool(thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT)
 
     if _use_delta_thinking:
+        # Build the assistant message content: text prefix followed by any audio items.
+        thinking_prefix_audio_items = p.get("thinking_prefix_audio_items") or []
+        assistant_content = [{"type": "text", "text": f"<think>{thinking_prefix}"}]
+        if thinking_prefix_audio_items:
+            # Materialise base64 audio blobs to temp files so they pass through _build_messages.
+            for audio_item in thinking_prefix_audio_items:
+                if isinstance(audio_item, dict) and audio_item.get("type") == "audio" and audio_item.get("data"):
+                    suffix = audio_item.get("suffix") or ".wav"
+                    path = _save_temp_b64(audio_item["data"], suffix)
+                    assistant_content.append({"type": "audio", "audio": path})
         messages.append({
             "role": "assistant",
-            "content": [{"type": "text", "text": f"<think>{thinking_prefix}"}],
+            "content": assistant_content,
         })
         _logger.info(
             f"[{request_id}] Delta-thinking prefix injected "
-            f"({len(thinking_prefix)} chars); using continue_final_message=True"
+            f"({len(thinking_prefix)} chars, {len(thinking_prefix_audio_items)} audio item(s)); "
+            f"using continue_final_message=True"
         )
 
     prompt_text = processor.apply_chat_template(
