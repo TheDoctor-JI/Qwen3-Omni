@@ -626,6 +626,20 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         thinking_block_injection = ""
     _use_block_injection = bool(thinking_block_injection and not _MODEL_IS_INSTRUCT)
 
+    # Safety guard: when injecting a closed thinking block we call apply_chat_template
+    # with add_generation_prompt=True (enable_thinking=True), so the template produces
+    # "...<|im_start|>assistant\n" with no prefilled think tag.  If enable_thinking=False
+    # the template would instead emit an empty "<think>\n\n</think>\n\n" prefix, which
+    # would be immediately followed by the injected block — two think blocks in a row.
+    # Force enable_thinking=True whenever block injection is active.
+    if _use_block_injection and not template_enable_thinking:
+        _logger.warning(
+            f"[{request_id}] thinking_block_injection requires enable_thinking=True "
+            f"(enable_thinking=False would emit an empty think prefix before the injected block). "
+            f"Forcing enable_thinking=True."
+        )
+        template_enable_thinking = True
+
     if _use_delta_thinking:
         # Build the assistant message content: text prefix followed by any audio items.
         thinking_prefix_audio_items = p.get("thinking_prefix_audio_items") or []
@@ -648,16 +662,15 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         )
 
     if _use_block_injection:
-        messages.append({
-            "role": "assistant",
-            "content": [{"type": "text", "text": f"<think>{thinking_block_injection}</think>"}],
-        })
-        _logger.info(
-            f"[{request_id}] Closed thinking-block injection appended "
-            f"({len(thinking_block_injection)} chars); using continue_final_message=True"
-        )
+        # Do NOT append to messages or use continue_final_message=True.
+        # apply_chat_template hangs when continue_final_message=True is combined with
+        # a last assistant message ending in </think> (regardless of enable_thinking value).
+        # Instead, apply_chat_template runs with add_generation_prompt=True (enable_thinking=True,
+        # enforced by the safety guard above), producing "...<|im_start|>assistant\n".
+        # We then append the closed block directly to the prompt string.
+        pass
 
-    _use_continue = _use_delta_thinking or _use_block_injection
+    _use_continue = _use_delta_thinking  # block injection is handled via manual string appending
     prompt_text = processor.apply_chat_template(
         messages,
         tokenize=False,
@@ -665,6 +678,13 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         **(dict(continue_final_message=True) if _use_continue else {}),
         enable_thinking=template_enable_thinking,
     )
+
+    if _use_block_injection:
+        prompt_text += f"<think>{thinking_block_injection}</think>\n\n"
+        _logger.info(
+            f"[{request_id}] Closed thinking-block injection appended to prompt "
+            f"({len(thinking_block_injection)} chars)"
+        )
 
     _logger.debug(
         f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
