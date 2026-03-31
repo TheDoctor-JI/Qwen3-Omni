@@ -616,6 +616,16 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     thinking_prefix = str(p.get("thinking_prefix", "") or "")
     _use_delta_thinking = bool(thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT)
 
+    thinking_block_injection = str(p.get("thinking_block_injection", "") or "")
+    # Mutual exclusion: thinking_prefix (open block) wins over thinking_block_injection (closed block).
+    if thinking_prefix and thinking_block_injection:
+        _logger.warning(
+            f"[{request_id}] Both thinking_prefix and thinking_block_injection were provided; "
+            f"thinking_prefix takes priority, thinking_block_injection discarded."
+        )
+        thinking_block_injection = ""
+    _use_block_injection = bool(thinking_block_injection and not _MODEL_IS_INSTRUCT)
+
     if _use_delta_thinking:
         # Build the assistant message content: text prefix followed by any audio items.
         thinking_prefix_audio_items = p.get("thinking_prefix_audio_items") or []
@@ -637,11 +647,22 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
             f"using continue_final_message=True"
         )
 
+    if _use_block_injection:
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"<think>{thinking_block_injection}</think>"}],
+        })
+        _logger.info(
+            f"[{request_id}] Closed thinking-block injection appended "
+            f"({len(thinking_block_injection)} chars); using continue_final_message=True"
+        )
+
+    _use_continue = _use_delta_thinking or _use_block_injection
     prompt_text = processor.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=not _use_delta_thinking,
-        **(dict(continue_final_message=True) if _use_delta_thinking else {}),
+        add_generation_prompt=not _use_continue,
+        **(dict(continue_final_message=True) if _use_continue else {}),
         enable_thinking=template_enable_thinking,
     )
 
