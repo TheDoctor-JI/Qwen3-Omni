@@ -844,7 +844,6 @@ async def _stream_generate(sio, sid, model, processor, payload,
                   total_time = elapsed
                   post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
                   tps = n_tokens / total_time if total_time > 0 else 0.0
-                  _t_first_response_token_final = _t_first_response_token if _t_first_response_token is not None else ttft
                   token_payload.update({
                   "full_generation_latency_sec": round(total_time, 3),
                   "total_time": round(total_time, 3),  # legacy alias
@@ -853,7 +852,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "generation_duration": round(post_ttft_duration, 3),
                     "generated_tokens": n_tokens,
                     "time_to_first_token": round(ttft, 3) if ttft is not None else None,
-                    "llm_time_to_first_response_token": round(_t_first_response_token_final, 3) if _t_first_response_token_final is not None else None,
+                    "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
                     "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
                     "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
                     "input_text_tokens": input_text_tokens,
@@ -863,10 +862,10 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
 
-        # Fallback: if thinking never ended or no response content detected,
-        # time_to_first_response_token equals ttft.
-        if _t_first_response_token is None:
-            _t_first_response_token = ttft
+        # NOTE: _t_first_response_token is intentionally left as None when no
+        # actual response token was produced (listen decision, thinking overrun,
+        # pure EOS).  The system-mode layer is responsible for computing a
+        # theoretical minimum from the available timing fields.
 
         total_time = time.perf_counter() - t_start
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
