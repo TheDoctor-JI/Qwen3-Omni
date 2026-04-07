@@ -1006,6 +1006,8 @@ def create_socketio_app(model, processor):
         async_mode="aiohttp",
         cors_allowed_origins="*",
         max_http_buffer_size=200 * 1024 * 1024,   # 200 MB – enough for audio/video
+        ping_timeout=600,     # 10 min – thinking-mode generations can run for minutes
+        ping_interval=30,     # keep-alive interval; must be < ping_timeout
     )
     app = web.Application()
     sio.attach(app)
