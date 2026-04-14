@@ -47,6 +47,11 @@ Socket.IO protocol
            full_generation_latency_sec, num_tokens, tokens_per_second, ttft,
                  generation_duration, generated_tokens,
                  time_to_first_token }
+    "generation_timed_out" { request_id, partial_text,
+                 full_generation_latency_sec, num_tokens, tokens_per_second,
+                 ttft, generation_duration, generated_tokens,
+                 time_to_first_token, allowed_gen_duration_s }
+                           — emitted when allowed_gen_duration_s timeout is reached.
     "generation_error"     { request_id, error }
 
   Timing semantics:
@@ -733,11 +738,18 @@ async def _stream_generate(sio, sid, model, processor, payload,
     request_id = payload.get('request_id') or str(uuid.uuid4())
     p = payload.get('params') or {}
     thinking_mode = bool(p.get('thinking_mode', True))
-    _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}")
+    allowed_gen_duration_s = p.get('allowed_gen_duration_s', None)
+    if allowed_gen_duration_s is not None:
+        allowed_gen_duration_s = float(allowed_gen_duration_s)
+    _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}"
+                 f"{f', allowed_gen_duration_s={allowed_gen_duration_s}' if allowed_gen_duration_s is not None else ''}")
     # _logger.debug(f"[{request_id}] Incoming payload: {payload}")
     
     open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
     close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
+
+    # Start the deadline clock before preprocessing so encoding time counts.
+    _t_deadline_start = time.perf_counter() if allowed_gen_duration_s is not None else None
 
     # Offload blocking preprocessing (base64 decode, tokenization,
     # audio/image feature extraction) to a worker thread so the event
@@ -753,6 +765,42 @@ async def _stream_generate(sio, sid, model, processor, payload,
     ) = await asyncio.to_thread(
         _prepare_inputs, processor, payload, session_cache,
     )
+
+    # Check if preprocessing alone already exceeded the generation deadline.
+    if _t_deadline_start is not None:
+        _prep_elapsed = time.perf_counter() - _t_deadline_start
+        if _prep_elapsed >= allowed_gen_duration_s:
+            _logger.info(
+                f"[{request_id}] allowed_gen_duration_s={allowed_gen_duration_s}s exceeded "
+                f"during preprocessing ({_prep_elapsed:.3f}s), aborting before generation"
+            )
+            for path in temp_files:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            await sio.emit("generation_timed_out", {
+                "request_id":        request_id,
+                "partial_text":      "",
+                "full_generation_latency_sec": round(_prep_elapsed, 3),
+                "total_time":        round(_prep_elapsed, 3),
+                "num_tokens":        0,
+                "tokens_per_second": 0.0,
+                "ttft":              None,
+                "generation_duration": 0.0,
+                "generated_tokens":    0,
+                "time_to_first_token": None,
+                "llm_time_to_first_response_token": None,
+                "thinking_time_to_first_token": 0.0,
+                "thinking_duration": 0.0,
+                "input_text_tokens":   input_text_tokens,
+                "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+                "max_response_tokens_effective": None,
+                "response_tokens_generated": None,
+                "max_response_tokens_reached": False,
+                "allowed_gen_duration_s": allowed_gen_duration_s,
+            }, to=sid)
+            return
 
     # Determine effective max_response_tokens.
     # Active only when: value is not None AND thinking is enabled AND model is not instruct-only.
@@ -796,6 +844,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
     _t_think_end   = None   # elapsed when </think> was first detected
     _n_tokens_at_think_end = None  # token count when </think> detected
     _max_response_tokens_reached = False
+    _gen_timed_out = False
 
     # Delta-thinking prefix: if the client sent a non-empty thinking_prefix
     # with thinking enabled on a thinking-capable model, generation starts
@@ -807,6 +856,16 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
     try:
         async for output in model.generate(inputs, sampling_params, request_id):
+            # Check allowed_gen_duration_s deadline.
+            if _t_deadline_start is not None:
+                if time.perf_counter() - _t_deadline_start >= allowed_gen_duration_s:
+                    _gen_timed_out = True
+                    _logger.info(
+                        f"[{request_id}] allowed_gen_duration_s={allowed_gen_duration_s}s deadline reached, aborting"
+                    )
+                    await model.abort(request_id)
+                    break
+
             output_item = output.outputs[0] if output.outputs else None
             full_text = output_item.text if output_item is not None else prev_text
 
@@ -919,39 +978,66 @@ async def _stream_generate(sio, sid, model, processor, payload,
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
         tps = n_tokens / total_time if total_time > 0 else 0.0
         _resp_gen = (n_tokens - _n_tokens_at_think_end) if _n_tokens_at_think_end is not None else None
-        if _think_started:
+
+        if _gen_timed_out:
             _logger.info(
-                f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps, "
-                f"thinking={'complete' if _think_ended else 'block did not close'}"
-                f"{', max_response_tokens_reached' if _max_response_tokens_reached else ''}"
+                f"[{request_id}] Generation timed out after {total_time:.3f}s "
+                f"(allowed_gen_duration_s={allowed_gen_duration_s}): "
+                f"{n_tokens} tokens, {tps:.1f} tps"
             )
+            await sio.emit("generation_timed_out", {
+                "request_id":        request_id,
+                "partial_text":      prev_text,
+                "full_generation_latency_sec": round(total_time, 3),
+                "total_time":        round(total_time, 3),
+                "num_tokens":        n_tokens,
+                "tokens_per_second": round(tps, 1),
+                "ttft":              round(ttft, 3) if ttft is not None else None,
+                "generation_duration": round(post_ttft_duration, 3),
+                "generated_tokens":    n_tokens,
+                "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+                "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+                "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
+                "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
+                "input_text_tokens":   input_text_tokens,
+                "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+                "max_response_tokens_effective": _effective_max_response,
+                "response_tokens_generated": _resp_gen,
+                "max_response_tokens_reached": _max_response_tokens_reached,
+                "allowed_gen_duration_s": allowed_gen_duration_s,
+            }, to=sid)
         else:
-            _logger.info(
-                f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps — "
-                f"no {open_tag} block detected (thinking_mode=False or model skipped reasoning)"
-            )
-        await sio.emit("generation_complete", {
-            "request_id":        request_id,
-            "full_text":         prev_text,
-          "full_generation_latency_sec": round(total_time, 3),
-          "total_time":        round(total_time,  3),  # legacy alias
-            "num_tokens":        n_tokens,
-            "tokens_per_second": round(tps, 1),
-            "ttft":              round(ttft, 3) if ttft is not None else None,
-          # Explicit efficiency aliases for downstream consumers.
-          # generation_duration is post-first-token generation time.
-          "generation_duration": round(post_ttft_duration, 3),
-          "generated_tokens":    n_tokens,
-          "time_to_first_token": round(ttft, 3) if ttft is not None else None,
-          "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
-          "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
-          "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
-          "input_text_tokens":   input_text_tokens,
-          "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
-          "max_response_tokens_effective": _effective_max_response,
-          "response_tokens_generated": _resp_gen,
-          "max_response_tokens_reached": _max_response_tokens_reached,
-        }, to=sid)
+            if _think_started:
+                _logger.info(
+                    f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps, "
+                    f"thinking={'complete' if _think_ended else 'block did not close'}"
+                    f"{', max_response_tokens_reached' if _max_response_tokens_reached else ''}"
+                )
+            else:
+                _logger.info(
+                    f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps — "
+                    f"no {open_tag} block detected (thinking_mode=False or model skipped reasoning)"
+                )
+            await sio.emit("generation_complete", {
+                "request_id":        request_id,
+                "full_text":         prev_text,
+                "full_generation_latency_sec": round(total_time, 3),
+                "total_time":        round(total_time,  3),  # legacy alias
+                "num_tokens":        n_tokens,
+                "tokens_per_second": round(tps, 1),
+                "ttft":              round(ttft, 3) if ttft is not None else None,
+                "generation_duration": round(post_ttft_duration, 3),
+                "generated_tokens":    n_tokens,
+                "time_to_first_token": round(ttft, 3) if ttft is not None else None,
+                "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+                "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
+                "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
+                "input_text_tokens":   input_text_tokens,
+                "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+                "max_response_tokens_effective": _effective_max_response,
+                "response_tokens_generated": _resp_gen,
+                "max_response_tokens_reached": _max_response_tokens_reached,
+            }, to=sid)
 
     except asyncio.CancelledError:
         _logger.info(f"[{request_id}] Generation cancelled (stopped by client)")
@@ -962,14 +1048,12 @@ async def _stream_generate(sio, sid, model, processor, payload,
         await sio.emit("generation_stopped", {
             "request_id":  request_id,
             "partial_text": prev_text,
-          "full_generation_latency_sec": round(total_time, 3),
-          "total_time":        round(total_time, 3),  # legacy alias
+            "full_generation_latency_sec": round(total_time, 3),
+            "total_time":        round(total_time, 3),
             "num_tokens":        n_tokens,
             "tokens_per_second": round(tps, 1),
             "ttft":              round(ttft, 3) if ttft is not None else None,
-            # Explicit efficiency aliases for downstream consumers.
-          # generation_duration is post-first-token generation time.
-          "generation_duration": round(post_ttft_duration, 3),
+            "generation_duration": round(post_ttft_duration, 3),
             "generated_tokens":    n_tokens,
             "time_to_first_token": round(ttft, 3) if ttft is not None else None,
             "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
