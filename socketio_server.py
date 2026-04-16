@@ -542,6 +542,13 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     top_k         = int  (p.get("top_k",        20))
     max_tokens    = int  (p.get("max_tokens",   16384))
     thinking_mode = bool (p.get("thinking_mode", True))
+    repetition_penalty   = float(p.get("repetition_penalty", 1.0))
+    presence_penalty     = float(p.get("presence_penalty",   0.0))
+    ignore_prompt_length = bool (p.get("ignore_prompt_length", True))
+    use_beam_search = bool(p.get("use_beam_search", False))
+    early_stopping  = bool(p.get("early_stopping",  False))
+    _raw_best_of    = p.get("best_of", None)
+    best_of         = int(_raw_best_of) if _raw_best_of is not None else None
 
     # max_response_tokens: optional cap on response tokens (after </think>).
     _raw_mrt = p.get("max_response_tokens", None)
@@ -550,7 +557,10 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     request_id = payload.get('request_id', '?')
     _logger.info(
         f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, "
-        f"max_tokens={max_tokens}, max_response_tokens={max_response_tokens}, temperature={temperature}"
+        f"max_tokens={max_tokens}, max_response_tokens={max_response_tokens}, temperature={temperature}, "
+        f"repetition_penalty={repetition_penalty}, presence_penalty={presence_penalty}, "
+        f"top_p={top_p}, top_k={top_k}, use_beam_search={use_beam_search}, "
+        f"early_stopping={early_stopping}, best_of={best_of}, ignore_prompt_length={ignore_prompt_length}"
     )
 
     # ---------------------------------------------------------------------------
@@ -700,11 +710,29 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     )
     input_text_tokens = _count_text_tokens(processor, prompt_text)
 
+    # When ignore_prompt_length=False, clip max_tokens so prompt + output fits
+    # within the model's context window (65535 tokens).  With True (default)
+    # we pass max_tokens as-is and let vLLM manage any overflow.
+    _MAX_MODEL_LEN = 65535
+    if not ignore_prompt_length and input_text_tokens is not None:
+        available = max(1, _MAX_MODEL_LEN - int(input_text_tokens))
+        if max_tokens > available:
+            _logger.info(
+                f"[{request_id}] max_tokens clipped {max_tokens} → {available} "
+                f"(prompt_tokens={input_text_tokens}, ignore_prompt_length=False)"
+            )
+            max_tokens = available
+
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         max_tokens=max_tokens,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        use_beam_search=use_beam_search,
+        early_stopping=early_stopping,
+        **(dict(best_of=best_of) if best_of is not None else {}),
         stop=["<|im_end|>", "<|im_start|>"],
     )
 
