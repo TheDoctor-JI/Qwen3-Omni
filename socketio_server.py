@@ -540,20 +540,35 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     temperature   = float(p.get("temperature",  0.7))
     top_p         = float(p.get("top_p",        0.95))
     top_k         = int  (p.get("top_k",        20))
-    max_tokens    = int  (p.get("max_tokens",   16384))
     thinking_mode = bool (p.get("thinking_mode", True))
     repetition_penalty   = float(p.get("repetition_penalty", 1.0))
     presence_penalty     = float(p.get("presence_penalty",   0.0))
     frequency_penalty    = float(p.get("frequency_penalty",  0.0))
 
-    # max_response_tokens: optional cap on response tokens (after </think>).
+    # Token budgets: separate thinking / response limits.
+    # max_thinking_tokens: hard cap on tokens inside the <think> block.
+    # max_response_tokens: hard cap on tokens after </think>.
+    # Legacy max_tokens is used only as a fallback when neither is provided.
+    _raw_mtt = p.get("max_thinking_tokens", None)
     _raw_mrt = p.get("max_response_tokens", None)
+    max_thinking_tokens = int(_raw_mtt) if _raw_mtt is not None else None
     max_response_tokens = int(_raw_mrt) if _raw_mrt is not None else None
+
+    # Compute effective max_tokens for vLLM SamplingParams.
+    if max_thinking_tokens is not None and max_response_tokens is not None:
+        max_tokens = max_thinking_tokens + max_response_tokens
+    elif max_thinking_tokens is not None:
+        max_tokens = max_thinking_tokens
+    elif max_response_tokens is not None:
+        max_tokens = max_response_tokens
+    else:
+        max_tokens = int(p.get("max_tokens", 16384))
 
     request_id = payload.get('request_id', '?')
     _logger.info(
         f"[{request_id}] Preparing inputs: thinking_mode={thinking_mode}, "
-        f"max_tokens={max_tokens}, max_response_tokens={max_response_tokens}, temperature={temperature}, "
+        f"max_thinking_tokens={max_thinking_tokens}, max_response_tokens={max_response_tokens}, "
+        f"max_tokens={max_tokens}, temperature={temperature}, "
         f"repetition_penalty={repetition_penalty}, presence_penalty={presence_penalty}, "
         f"frequency_penalty={frequency_penalty}, top_p={top_p}, top_k={top_k}"
     )
@@ -733,6 +748,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
       input_text_tokens,
       input_audio_duration_sec,
       max_response_tokens,
+      max_thinking_tokens,
     )
 
 
@@ -770,6 +786,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
       input_text_tokens,
       input_audio_duration_sec,
       max_response_tokens,
+      max_thinking_tokens,
     ) = await asyncio.to_thread(
         _prepare_inputs, processor, payload, session_cache,
     )
@@ -806,6 +823,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 "max_response_tokens_effective": None,
                 "response_tokens_generated": None,
                 "max_response_tokens_reached": False,
+                "thinking_budget_burned_out": False,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
             return
@@ -826,6 +844,28 @@ async def _stream_generate(sio, sid, model, processor, payload,
             _effective_max_response = max_response_tokens
             _logger.info(
                 f"[{request_id}] max_response_tokens enforcement active: cap={max_response_tokens}"
+            )
+
+    # Determine effective max_thinking_tokens.
+    # Active only when: value is not None AND thinking is enabled AND model is not instruct-only.
+    _effective_max_thinking = None
+    if max_thinking_tokens is not None:
+        if not thinking_mode:
+            _logger.debug(
+                f"[{request_id}] max_thinking_tokens={max_thinking_tokens} ignored: thinking_mode=False"
+            )
+        elif _MODEL_IS_INSTRUCT:
+            _logger.debug(
+                f"[{request_id}] max_thinking_tokens={max_thinking_tokens} ignored: instruct model"
+            )
+        elif max_thinking_tokens == 0:
+            _logger.debug(
+                f"[{request_id}] max_thinking_tokens=0: no thinking budget to enforce"
+            )
+        else:
+            _effective_max_thinking = max_thinking_tokens
+            _logger.info(
+                f"[{request_id}] max_thinking_tokens enforcement active: cap={max_thinking_tokens}"
             )
 
     # Notify client which items are confirmed in the encoding cache.
@@ -852,6 +892,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
     _t_think_end   = None   # elapsed when </think> was first detected
     _n_tokens_at_think_end = None  # token count when </think> detected
     _max_response_tokens_reached = False
+    _thinking_budget_burned_out = False
     _gen_timed_out = False
 
     # Delta-thinking prefix: if the client sent a non-empty thinking_prefix
@@ -900,6 +941,23 @@ async def _stream_generate(sio, sid, model, processor, payload,
                         f"[{request_id}] Thinking block ENDED (~{think_chars} chars of reasoning, "
                         f"n_tokens_at_think_end={_n_tokens_at_think_end})"
                     )
+
+                # Enforce max_thinking_tokens cap.
+                # While still inside the thinking block, if token count exceeds
+                # the budget, abort generation and flag the burnout.
+                if (
+                    _effective_max_thinking is not None
+                    and _think_started
+                    and not _think_ended
+                    and n_tokens >= _effective_max_thinking
+                ):
+                    _thinking_budget_burned_out = True
+                    _logger.info(
+                        f"[{request_id}] max_thinking_tokens cap reached: "
+                        f"{n_tokens} >= {_effective_max_thinking}, aborting generation"
+                    )
+                    await model.abort(request_id)
+                    break
 
                 # Enforce max_response_tokens cap
                 if (
@@ -972,15 +1030,16 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "max_response_tokens_effective": _effective_max_response,
                     "response_tokens_generated": _resp_gen,
                     "max_response_tokens_reached": _max_response_tokens_reached,
+                    "thinking_budget_burned_out": _thinking_budget_burned_out,
                   })
 
                 await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
 
-        # NOTE: _t_first_response_token is intentionally left as None when no
-        # actual response token was produced (listen decision, thinking overrun,
-        # pure EOS).  The system-mode layer is responsible for computing a
-        # theoretical minimum from the available timing fields.
+        # NOTE: _t_first_response_token may be None when no response token was
+        # produced (e.g. listen decision, thinking burnout, pure EOS).  The
+        # runtime layer handles two-pass recovery when thinking_budget_burned_out
+        # is True.
 
         total_time = time.perf_counter() - t_start
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
@@ -1012,6 +1071,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 "max_response_tokens_effective": _effective_max_response,
                 "response_tokens_generated": _resp_gen,
                 "max_response_tokens_reached": _max_response_tokens_reached,
+                "thinking_budget_burned_out": _thinking_budget_burned_out,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
         else:
@@ -1045,6 +1105,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 "max_response_tokens_effective": _effective_max_response,
                 "response_tokens_generated": _resp_gen,
                 "max_response_tokens_reached": _max_response_tokens_reached,
+                "thinking_budget_burned_out": _thinking_budget_burned_out,
             }, to=sid)
 
     except asyncio.CancelledError:
@@ -1072,6 +1133,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
             "max_response_tokens_effective": _effective_max_response,
             "response_tokens_generated": _resp_gen,
             "max_response_tokens_reached": _max_response_tokens_reached,
+            "thinking_budget_burned_out": _thinking_budget_burned_out,
         }, to=sid)
 
     except Exception as exc:
