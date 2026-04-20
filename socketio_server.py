@@ -98,7 +98,7 @@ _logger = logging.getLogger('socketio_server')
 # _stream_generate_inner.  Covers every vLLM output item and every
 # Socket.IO event emitted to the client.  Flip to False for production.
 # Can also be overridden at startup via --stream-trace CLI flag.
-STREAM_TRACE: bool = False
+STREAM_TRACE: bool = True
 
 os.environ['VLLM_USE_V1'] = '0'
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
@@ -1124,11 +1124,20 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
         # is True.
 
         # --- Synthetic close-tag injection ---
-        # When the stream ends mid-thinking (burnout, timeout, or any other
-        # early exit), the complete </think> tag was never produced.  Emit the
-        # missing suffix so that every consumer (client iterator, frontend GUI)
-        # always sees a well-formed close tag.
-        if _think_started and not _think_ended:
+        # After the generation loop exits, check whether the client has
+        # received a complete close tag.  This covers three scenarios:
+        #   (a) Thinking burnout — max_thinking_tokens fired mid-thought,
+        #       _think_ended is still False.
+        #   (b) Timeout — generation timed out while still inside the
+        #       thinking block, _think_ended is still False.
+        #   (c) Cap-skipped emit — the close tag was *detected* in-loop
+        #       (so _think_ended is True) but the token carrying its tail
+        #       was never emitted because max_response_tokens broke out of
+        #       the loop on the same iteration.
+        # In every case the criterion is the same: _think_started is True
+        # but prev_text (which tracks exactly what was sent to the client)
+        # does not contain the complete close tag.
+        if thinking_mode and _think_started and close_tag not in prev_text:
             synth_delta = close_tag  # full tag by default
             for plen in range(len(close_tag) - 1, 0, -1):
                 if prev_text.endswith(close_tag[:plen]):
@@ -1136,12 +1145,14 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     break
             prev_text = prev_text + synth_delta
             n_tokens += 1
-            _think_ended = True
-            _t_think_end = time.perf_counter() - t_start
-            _n_tokens_at_think_end = n_tokens
+            if not _think_ended:
+                _think_ended = True
+                _t_think_end = time.perf_counter() - t_start
+                _n_tokens_at_think_end = n_tokens
             _logger.info(
                 f"[{request_id}] Synthetic close tag injected: {repr(synth_delta)} "
-                f"(burnout={_thinking_budget_burned_out}, timed_out={_gen_timed_out})"
+                f"(burnout={_thinking_budget_burned_out}, timed_out={_gen_timed_out}, "
+                f"cap_skipped_emit={_max_response_tokens_reached})"
             )
             _synth_close_payload = {
                 "request_id": request_id,
