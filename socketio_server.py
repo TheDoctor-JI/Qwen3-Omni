@@ -1086,6 +1086,40 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
             }, to=sid)
 
+        # --- Synthetic open-tag + close-tag injection ---
+        # When thinking_mode is on and the stream was cut so early that only
+        # a partial open-tag prefix was emitted (and nothing else), complete
+        # the open tag and immediately close it so downstream consumers see a
+        # well-formed empty thinking block instead of garbage output text.
+        # Strict check: prev_text must be *exactly* a leading prefix of
+        # open_tag (nothing more, nothing less).
+        if thinking_mode and not _think_started and not _think_ended:
+            for plen in range(len(open_tag) - 1, 0, -1):
+                if prev_text == open_tag[:plen]:
+                    synth_delta = open_tag[plen:] + close_tag
+                    prev_text = prev_text + synth_delta
+                    n_tokens += 1
+                    _think_started = True
+                    _think_ended = True
+                    _t_think_end = time.perf_counter() - t_start
+                    _n_tokens_at_think_end = n_tokens
+                    _logger.info(
+                        f"[{request_id}] Synthetic open+close tag injected: {repr(synth_delta)} "
+                        f"(prev_text was partial open-tag prefix {repr(open_tag[:plen])})"
+                    )
+                    await sio.emit("token", {
+                        "request_id": request_id,
+                        "delta":      synth_delta,
+                        "full_text":  prev_text,
+                        "num_tokens": n_tokens,
+                        "elapsed":    round(time.perf_counter() - t_start, 3),
+                        "ttft":       round(ttft, 3) if ttft is not None else None,
+                        "finished":   False,
+                        "input_text_tokens": input_text_tokens,
+                        "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+                    }, to=sid)
+                    break
+
         total_time = time.perf_counter() - t_start
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
         tps = n_tokens / total_time if total_time > 0 else 0.0
@@ -2117,10 +2151,23 @@ function startAsstBubble() {
 
 // Parse full accumulated buffer into {thinkText, outputText, thinkOpen, thinkDone}
 function parseBuf(buf) {
-  const open  = buf.indexOf('<think>');
-  const close = buf.indexOf('</think>');
+  const openTag  = '<think>';
+  const closeTag = '</think>';
+  const open  = buf.indexOf(openTag);
+  const close = buf.indexOf(closeTag);
   if (open === -1) {
-    return { thinkText: '', outputText: buf, thinkOpen: false, thinkDone: false };
+    // Suppress any trailing partial-tag prefix that might still be assembling.
+    // e.g. buf = 'hello<thi' — '<thi' is a prefix of '<think>' so exclude it.
+    const maxPLen = Math.max(openTag.length, closeTag.length) - 1;
+    let safeLen = buf.length;
+    for (let plen = Math.min(maxPLen, buf.length); plen >= 1; plen--) {
+      const tail = buf.slice(buf.length - plen);
+      if (openTag.startsWith(tail) || closeTag.startsWith(tail)) {
+        safeLen = buf.length - plen;
+        break;
+      }
+    }
+    return { thinkText: '', outputText: buf.slice(0, safeLen), thinkOpen: false, thinkDone: false };
   }
   const thinkText = buf.slice(open + 7, close !== -1 ? close : buf.length);
   const outputText = close !== -1 ? buf.slice(close + 8) : '';
@@ -2175,6 +2222,19 @@ function appendDelta(delta) {
     span.textContent = newChars;
     outputEl.insertBefore(span, null); // append to outputEl
     span.addEventListener('animationend', () => span.classList.remove('tok'), { once: true });
+  } else if (outputText.length < rendOut) {
+    // outputText shrank because a partial tag prefix was completed into a
+    // real tag — clear the output element and re-render from scratch.
+    outputEl.textContent = '';
+    rendOut = 0;
+    if (outputText) {
+      const span = document.createElement('span');
+      span.className = 'tok';
+      span.textContent = outputText;
+      outputEl.appendChild(span);
+      rendOut = outputText.length;
+      span.addEventListener('animationend', () => span.classList.remove('tok'), { once: true });
+    }
   }
 
   scrollDown();
