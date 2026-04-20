@@ -642,6 +642,9 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     #   - thinking_mode is True (caller requested thinking)
     #   - model is NOT instruct-only (instruct models lack think-tag support)
     # -----------------------------------------------------------------------
+    open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
+    close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
+
     thinking_prefix = str(p.get("thinking_prefix", "") or "")
     _use_delta_thinking = bool(thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT)
 
