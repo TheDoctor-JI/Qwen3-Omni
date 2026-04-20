@@ -672,7 +672,12 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     if _use_delta_thinking:
         # Build the assistant message content: text prefix followed by any audio items.
         thinking_prefix_audio_items = p.get("thinking_prefix_audio_items") or []
-        assistant_content = [{"type": "text", "text": f"<think>{thinking_prefix}"}]
+        # Defensive strip: callers should send raw text without tags, but strip
+        # any leading <think> that may have leaked through.
+        _pfx = thinking_prefix
+        if _pfx.startswith(open_tag):
+            _pfx = _pfx[len(open_tag):]
+        assistant_content = [{"type": "text", "text": f"<think>{_pfx}"}]
         if thinking_prefix_audio_items:
             # Materialise base64 audio blobs to temp files so they pass through _build_messages.
             for audio_item in thinking_prefix_audio_items:
@@ -709,10 +714,18 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     )
 
     if _use_block_injection:
-        prompt_text += f"<think>{thinking_block_injection}</think>\n\n"
+        # Defensive strip: callers should send raw text without tags, but strip
+        # any leading <think> or trailing </think> that may have leaked through.
+        _inj = thinking_block_injection
+        if _inj.startswith(open_tag):
+            _inj = _inj[len(open_tag):]
+        if _inj.endswith(close_tag):
+            _inj = _inj[:-len(close_tag)]
+        _inj = _inj.strip()
+        prompt_text += f"<think>{_inj}</think>\n\n"
         _logger.info(
             f"[{request_id}] Closed thinking-block injection appended to prompt "
-            f"({len(thinking_block_injection)} chars)"
+            f"({len(_inj)} chars)"
         )
 
     _logger.debug(
@@ -1041,6 +1054,38 @@ async def _stream_generate(sio, sid, model, processor, payload,
         # runtime layer handles two-pass recovery when thinking_budget_burned_out
         # is True.
 
+        # --- Synthetic close-tag injection ---
+        # When the stream ends mid-thinking (burnout, timeout, or any other
+        # early exit), the complete </think> tag was never produced.  Emit the
+        # missing suffix so that every consumer (client iterator, frontend GUI)
+        # always sees a well-formed close tag.
+        if _think_started and not _think_ended:
+            synth_delta = close_tag  # full tag by default
+            for plen in range(len(close_tag) - 1, 0, -1):
+                if prev_text.endswith(close_tag[:plen]):
+                    synth_delta = close_tag[plen:]  # only the missing tail
+                    break
+            prev_text = prev_text + synth_delta
+            n_tokens += 1
+            _think_ended = True
+            _t_think_end = time.perf_counter() - t_start
+            _n_tokens_at_think_end = n_tokens
+            _logger.info(
+                f"[{request_id}] Synthetic close tag injected: {repr(synth_delta)} "
+                f"(burnout={_thinking_budget_burned_out}, timed_out={_gen_timed_out})"
+            )
+            await sio.emit("token", {
+                "request_id": request_id,
+                "delta":      synth_delta,
+                "full_text":  prev_text,
+                "num_tokens": n_tokens,
+                "elapsed":    round(time.perf_counter() - t_start, 3),
+                "ttft":       round(ttft, 3) if ttft is not None else None,
+                "finished":   False,
+                "input_text_tokens": input_text_tokens,
+                "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+            }, to=sid)
+
         total_time = time.perf_counter() - t_start
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
         tps = n_tokens / total_time if total_time > 0 else 0.0
@@ -1110,6 +1155,32 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
     except asyncio.CancelledError:
         _logger.info(f"[{request_id}] Generation cancelled (stopped by client)")
+        # Synthetic close-tag injection (same as post-loop path above).
+        if _think_started and not _think_ended:
+            synth_delta = close_tag
+            for plen in range(len(close_tag) - 1, 0, -1):
+                if prev_text.endswith(close_tag[:plen]):
+                    synth_delta = close_tag[plen:]
+                    break
+            prev_text = prev_text + synth_delta
+            n_tokens += 1
+            _think_ended = True
+            _t_think_end = time.perf_counter() - t_start
+            _n_tokens_at_think_end = n_tokens
+            _logger.info(
+                f"[{request_id}] Synthetic close tag injected (cancelled): {repr(synth_delta)}"
+            )
+            await sio.emit("token", {
+                "request_id": request_id,
+                "delta":      synth_delta,
+                "full_text":  prev_text,
+                "num_tokens": n_tokens,
+                "elapsed":    round(time.perf_counter() - t_start, 3),
+                "ttft":       round(ttft, 3) if ttft is not None else None,
+                "finished":   False,
+                "input_text_tokens": input_text_tokens,
+                "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+            }, to=sid)
         total_time = time.perf_counter() - t_start
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
         tps = n_tokens / total_time if total_time > 0 else 0.0
@@ -2082,6 +2153,15 @@ function appendDelta(delta) {
     if (thinkDone) {
       thinkDet.open = false;
       thinkDet.querySelector('summary').textContent = '💭 Thinking (click to expand)';
+    }
+  } else if (thinkOpen && thinkText.length < rendThink) {
+    // thinkText shrank because a partial close-tag prefix was completed —
+    // clear the thinking body and re-render from scratch.
+    thinkBody.textContent = '';
+    rendThink = 0;
+    if (thinkText) {
+      appendFlash(thinkBody, thinkText);
+      rendThink = thinkText.length;
     }
   }
 
