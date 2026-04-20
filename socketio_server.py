@@ -91,6 +91,15 @@ import yaml
 # Module-level logger — replaced with a file-backed logger in __main__
 _logger = logging.getLogger('socketio_server')
 
+# ---------------------------------------------------------------------------
+# Stream tracing flag
+# ---------------------------------------------------------------------------
+# Set to True to enable verbose per-token and per-emit debug logs in
+# _stream_generate_inner.  Covers every vLLM output item and every
+# Socket.IO event emitted to the client.  Flip to False for production.
+# Can also be overridden at startup via --stream-trace CLI flag.
+STREAM_TRACE: bool = False
+
 os.environ['VLLM_USE_V1'] = '0'
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
@@ -968,6 +977,16 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             if ttft is None and n_tokens > prev_n_tokens:
                 ttft = elapsed
                 _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
+
+            if STREAM_TRACE:
+                finish_reason = getattr(output_item, 'finish_reason', None)
+                stop_reason  = getattr(output_item, 'stop_reason', None)
+                _logger.debug(
+                    "[%s][VLLM_OUT] finished=%s finish_reason=%r stop_reason=%r "
+                    "n_tokens=%d delta=%r full_text_tail=%r",
+                    request_id, output.finished, finish_reason, stop_reason,
+                    n_tokens, full_text[len(prev_text):], full_text[-30:],
+                )
             
             delta = full_text[len(prev_text):]
             if delta:
@@ -1076,6 +1095,26 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     "thinking_budget_burned_out": _thinking_budget_burned_out,
                   })
 
+                if STREAM_TRACE:
+                    # Log the tail of full_text and finished flag while inside the
+                    # thinking block, and also log the full token_payload being emitted.
+                    if _think_started and not _think_ended:
+                        _logger.debug(
+                            "[%s][THINK_TAIL] finished=%s n_tokens=%d "
+                            "full_text_tail=%r delta=%r",
+                            request_id, output.finished, n_tokens,
+                            full_text[-30:], delta,
+                        )
+                    _logger.debug(
+                        "[%s][EMIT token] finished=%s n_tokens=%d "
+                        "delta=%r full_text_tail=%r",
+                        request_id,
+                        token_payload.get('finished'),
+                        token_payload.get('num_tokens'),
+                        token_payload.get('delta'),
+                        token_payload.get('full_text', '')[-30:],
+                    )
+
                 await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
 
@@ -1104,7 +1143,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 f"[{request_id}] Synthetic close tag injected: {repr(synth_delta)} "
                 f"(burnout={_thinking_budget_burned_out}, timed_out={_gen_timed_out})"
             )
-            await sio.emit("token", {
+            _synth_close_payload = {
                 "request_id": request_id,
                 "delta":      synth_delta,
                 "full_text":  prev_text,
@@ -1114,7 +1153,13 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "finished":   False,
                 "input_text_tokens": input_text_tokens,
                 "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
-            }, to=sid)
+            }
+            if STREAM_TRACE:
+                _logger.debug(
+                    "[%s][EMIT token/synth-close] delta=%r full_text_tail=%r",
+                    request_id, synth_delta, prev_text[-30:],
+                )
+            await sio.emit("token", _synth_close_payload, to=sid)
 
         # --- Synthetic open-tag + close-tag injection ---
         # When thinking_mode is on and the stream was cut so early that only
@@ -1137,7 +1182,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         f"[{request_id}] Synthetic open+close tag injected: {repr(synth_delta)} "
                         f"(prev_text was partial open-tag prefix {repr(open_tag[:plen])})"
                     )
-                    await sio.emit("token", {
+                    _synth_oc_payload = {
                         "request_id": request_id,
                         "delta":      synth_delta,
                         "full_text":  prev_text,
@@ -1147,7 +1192,13 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         "finished":   False,
                         "input_text_tokens": input_text_tokens,
                         "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
-                    }, to=sid)
+                    }
+                    if STREAM_TRACE:
+                        _logger.debug(
+                            "[%s][EMIT token/synth-open-close] delta=%r full_text_tail=%r",
+                            request_id, synth_delta, prev_text[-30:],
+                        )
+                    await sio.emit("token", _synth_oc_payload, to=sid)
                     break
 
         total_time = time.perf_counter() - t_start
@@ -1161,6 +1212,11 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 f"(allowed_gen_duration_s={allowed_gen_duration_s}): "
                 f"{n_tokens} tokens, {tps:.1f} tps"
             )
+            if STREAM_TRACE:
+                _logger.debug(
+                    "[%s][EMIT generation_timed_out] n_tokens=%d total_time=%.3f",
+                    request_id, n_tokens, total_time,
+                )
             await sio.emit("generation_timed_out", {
                 "request_id":        request_id,
                 "partial_text":      prev_text,
@@ -1194,6 +1250,11 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 _logger.info(
                     f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps — "
                     f"no {open_tag} block detected (thinking_mode=False or model skipped reasoning)"
+                )
+            if STREAM_TRACE:
+                _logger.debug(
+                    "[%s][EMIT generation_complete] n_tokens=%d total_time=%.3f full_text_tail=%r",
+                    request_id, n_tokens, total_time, prev_text[-30:],
                 )
             await sio.emit("generation_complete", {
                 "request_id":        request_id,
@@ -1234,6 +1295,11 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             _logger.info(
                 f"[{request_id}] Synthetic close tag injected (cancelled): {repr(synth_delta)}"
             )
+            if STREAM_TRACE:
+                _logger.debug(
+                    "[%s][EMIT token/synth-close-cancelled] delta=%r full_text_tail=%r",
+                    request_id, synth_delta, prev_text[-30:],
+                )
             await sio.emit("token", {
                 "request_id": request_id,
                 "delta":      synth_delta,
@@ -1249,6 +1315,11 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
         post_ttft_duration = max(0.0, total_time - (ttft or 0.0))
         tps = n_tokens / total_time if total_time > 0 else 0.0
         _resp_gen = (n_tokens - _n_tokens_at_think_end) if _n_tokens_at_think_end is not None else None
+        if STREAM_TRACE:
+            _logger.debug(
+                "[%s][EMIT generation_stopped] n_tokens=%d total_time=%.3f",
+                request_id, n_tokens, total_time,
+            )
         await sio.emit("generation_stopped", {
             "request_id":  request_id,
             "partial_text": prev_text,
@@ -2613,6 +2684,11 @@ def _get_args():
         "--port", type=int, default=8902,
         help="Bind port (default: 8902)",
     )
+    parser.add_argument(
+        "--stream-trace", action="store_true", default=False,
+        help="Enable verbose per-token / per-emit DEBUG logs (STREAM_TRACE mode). "
+             "Logs every vLLM output item and every Socket.IO event emitted to the client.",
+    )
     return parser.parse_args()
 
 
@@ -2625,6 +2701,10 @@ if __name__ == "__main__":
     from logger.logger import setup_logger as _setup_logger
     _logger = _setup_logger('socketio_server', file_log_level='DEBUG', terminal_log_level='INFO')
     sys.path.pop(0)
+
+    if args.stream_trace:
+        STREAM_TRACE = True
+        _logger.info("STREAM_TRACE enabled — verbose per-token and per-emit DEBUG logs active")
 
     _logger.info(f"Loading model from: {args.checkpoint_path}")
     model, processor = _load_model_processor(args)
