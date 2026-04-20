@@ -81,6 +81,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -784,7 +785,33 @@ async def _stream_generate(sio, sid, model, processor, payload,
     _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}"
                  f"{f', allowed_gen_duration_s={allowed_gen_duration_s}' if allowed_gen_duration_s is not None else ''}")
     # _logger.debug(f"[{request_id}] Incoming payload: {payload}")
-    
+
+    temp_files = []  # initialised early so finally-cleanup always works
+    try:
+      return await _stream_generate_inner(
+          sio, sid, model, processor, payload, session_cache,
+          request_id, p, thinking_mode, allowed_gen_duration_s,
+      )
+    except Exception as exc:
+        tb_str = traceback.format_exc()
+        _logger.error(f"[{request_id}] Unhandled error in _stream_generate: {exc}", exc_info=True)
+        try:
+            await sio.emit("generation_error", {
+                "request_id": request_id,
+                "error": str(exc),
+                "traceback": tb_str,
+            }, to=sid)
+        except Exception:
+            _logger.debug(f"[{request_id}] Failed to emit generation_error to client", exc_info=True)
+
+
+async def _stream_generate_inner(sio, sid, model, processor, payload,
+                                 session_cache, request_id, p,
+                                 thinking_mode, allowed_gen_duration_s):
+    """Inner implementation of _stream_generate, wrapped by the outer
+    function's top-level error safety net."""
+
+    temp_files = []  # ensure cleanup is safe even if _prepare_inputs raises
     open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
     close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
 
@@ -1249,6 +1276,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
         await sio.emit("generation_error", {
             "request_id": request_id,
             "error":      str(exc),
+            "traceback":  traceback.format_exc(),
         }, to=sid)
 
     finally:
