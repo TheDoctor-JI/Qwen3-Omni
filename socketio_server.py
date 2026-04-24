@@ -934,6 +934,29 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
       "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
     }, to=sid)
 
+    # Abort-word watchlist: when any phrase in this list appears inside the
+    # streaming thinking block, suppress emission of the matched substring
+    # (and everything after it within that token), abort vLLM, and surface a
+    # `thinking_abort_word_detected` flag so downstream callers can treat the
+    # event analogously to `thinking_budget_burned_out` (no-op for eval/summary,
+    # two-pass force-response for action).  Text-substring matching against
+    # `full_text` is BPE-invariant by construction, since `full_text` is the
+    # already-decoded model output.  The check is gated on `_think_started
+    # and not _think_ended`, so this is a no-op when thinking is disabled or
+    # has already closed.  TTFR statistics are unaffected: `ttft` and
+    # `_t_first_response_token` are anchored to the model's first generated
+    # token, not to client emission.
+    _abort_word_list_raw = p.get('thinking_abort_word_list') or []
+    _abort_word_list: List[str] = [
+        str(w) for w in _abort_word_list_raw
+        if isinstance(w, str) and w
+    ] if isinstance(_abort_word_list_raw, list) else []
+    if _abort_word_list:
+        _logger.info(
+            f"[{request_id}] thinking_abort_word_list active: "
+            f"{_abort_word_list!r}"
+        )
+
     t_start      = time.perf_counter()
     prev_text    = ""
     n_tokens     = 0
@@ -945,6 +968,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     _n_tokens_at_think_end = None  # token count when </think> detected
     _max_response_tokens_reached = False
     _thinking_budget_burned_out = False
+    _thinking_abort_word_detected = False
+    _thinking_abort_word_match: Optional[str] = None
     _gen_timed_out = False
 
     # Delta-thinking prefix: if the client sent a non-empty thinking_prefix
@@ -1037,6 +1062,68 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         await model.abort(request_id)
                         break
 
+                # Abort-word watchlist enforcement.  Only active inside an
+                # open thinking block.  Scan `full_text` for the earliest
+                # occurrence (across all phrases) of any abort word that
+                # extends into the freshly generated suffix
+                # (i.e. would-be-emitted bytes), then truncate the would-be
+                # delta to the bytes that precede the match position before
+                # aborting.  This guarantees the abort phrase itself never
+                # reaches the client.
+                if (
+                    _abort_word_list
+                    and _think_started
+                    and not _think_ended
+                ):
+                    _earliest_match_pos = -1
+                    _earliest_match_phrase = None
+                    for _phrase in _abort_word_list:
+                        # Locate the leftmost occurrence in full_text whose
+                        # tail extends past prev_text (i.e. the phrase is not
+                        # already fully behind us in already-emitted text).
+                        _idx = full_text.find(_phrase)
+                        while _idx >= 0 and _idx + len(_phrase) <= len(prev_text):
+                            _idx = full_text.find(_phrase, _idx + 1)
+                        if _idx < 0:
+                            continue
+                        if _earliest_match_pos < 0 or _idx < _earliest_match_pos:
+                            _earliest_match_pos = _idx
+                            _earliest_match_phrase = _phrase
+                    if _earliest_match_pos >= 0:
+                        _thinking_abort_word_detected = True
+                        _thinking_abort_word_match = _earliest_match_phrase
+                        _safe_emit_end = _earliest_match_pos
+                        _trunc_delta = full_text[len(prev_text):_safe_emit_end]
+                        _suppressed = full_text[_safe_emit_end:]
+                        _logger.info(
+                            f"[{request_id}] thinking_abort_word_detected: "
+                            f"phrase={_earliest_match_phrase!r} pos={_earliest_match_pos} "
+                            f"emit_chars={len(_trunc_delta)} suppress_chars={len(_suppressed)}"
+                        )
+                        if STREAM_TRACE:
+                            _logger.debug(
+                                "[%s][abort_word] phrase=%r pos=%d "
+                                "trunc_delta=%r suppressed=%r",
+                                request_id, _earliest_match_phrase,
+                                _earliest_match_pos, _trunc_delta, _suppressed,
+                            )
+                        if _trunc_delta:
+                            _abort_token_payload = {
+                                "request_id": request_id,
+                                "delta":      _trunc_delta,
+                                "full_text":  full_text[:_safe_emit_end],
+                                "num_tokens": n_tokens,
+                                "elapsed":    round(elapsed, 3),
+                                "ttft":       round(ttft, 3) if ttft is not None else None,
+                                "finished":   False,
+                                "input_text_tokens": input_text_tokens,
+                                "input_audio_duration_sec": round(float(input_audio_duration_sec), 3),
+                            }
+                            await sio.emit("token", _abort_token_payload, to=sid)
+                            prev_text = full_text[:_safe_emit_end]
+                        await model.abort(request_id)
+                        break
+
                 # Track first response token (non-thinking content).
                 # If no thinking block: set on first delta that is not a leading
                 #   prefix of open_tag (defers while "<", "<t", "<th"… are
@@ -1093,6 +1180,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     "response_tokens_generated": _resp_gen,
                     "max_response_tokens_reached": _max_response_tokens_reached,
                     "thinking_budget_burned_out": _thinking_budget_burned_out,
+                    "thinking_abort_word_detected": _thinking_abort_word_detected,
+                    "thinking_abort_word_match": _thinking_abort_word_match,
                   })
 
                 if STREAM_TRACE:
@@ -1248,6 +1337,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "response_tokens_generated": _resp_gen,
                 "max_response_tokens_reached": _max_response_tokens_reached,
                 "thinking_budget_burned_out": _thinking_budget_burned_out,
+                "thinking_abort_word_detected": _thinking_abort_word_detected,
+                "thinking_abort_word_match": _thinking_abort_word_match,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
         else:
@@ -1287,6 +1378,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "response_tokens_generated": _resp_gen,
                 "max_response_tokens_reached": _max_response_tokens_reached,
                 "thinking_budget_burned_out": _thinking_budget_burned_out,
+                "thinking_abort_word_detected": _thinking_abort_word_detected,
+                "thinking_abort_word_match": _thinking_abort_word_match,
             }, to=sid)
 
     except asyncio.CancelledError:
@@ -1351,6 +1444,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             "response_tokens_generated": _resp_gen,
             "max_response_tokens_reached": _max_response_tokens_reached,
             "thinking_budget_burned_out": _thinking_budget_burned_out,
+            "thinking_abort_word_detected": _thinking_abort_word_detected,
+            "thinking_abort_word_match": _thinking_abort_word_match,
         }, to=sid)
 
     except Exception as exc:
