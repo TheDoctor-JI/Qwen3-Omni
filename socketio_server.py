@@ -956,6 +956,10 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             f"[{request_id}] thinking_abort_word_list active: "
             f"{_abort_word_list!r}"
         )
+    else:
+        _logger.debug(
+            f"[{request_id}] thinking_abort_word_list: empty — abort-word detection disabled"
+        )
 
     t_start      = time.perf_counter()
     prev_text    = ""
@@ -1124,6 +1128,29 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         await model.abort(request_id)
                         break
 
+                # Abort-word prefix holdback — withholds trailing chars of full_text
+                # that form a leading prefix of any abort phrase, preventing leakage
+                # of partial phrases (e.g. "Wai" before "Wait,") to the client.
+                # Only active inside an open thinking block and only on non-final
+                # tokens: output.finished=True flushes everything since no next token
+                # can complete the phrase.
+                _safe_emit_end = len(full_text)
+                if _abort_word_list and _think_started and not _think_ended and not output.finished:
+                    for _phrase in _abort_word_list:
+                        for _k in range(len(_phrase) - 1, 0, -1):
+                            if full_text.endswith(_phrase[:_k]):
+                                _prefix_start = len(full_text) - _k
+                                if _prefix_start >= len(prev_text):
+                                    _safe_emit_end = min(_safe_emit_end, _prefix_start)
+                                break  # longest matching prefix for this phrase is sufficient
+                    if _safe_emit_end < len(full_text) and STREAM_TRACE:
+                        _logger.debug(
+                            "[%s][abort_word_holdback] holding back %d chars: %r",
+                            request_id, len(full_text) - _safe_emit_end,
+                            full_text[_safe_emit_end:],
+                        )
+                _safe_delta = full_text[len(prev_text):_safe_emit_end]
+
                 # Track first response token (non-thinking content).
                 # If no thinking block: set on first delta that is not a leading
                 #   prefix of open_tag (defers while "<", "<t", "<th"… are
@@ -1145,8 +1172,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
 
                 token_payload = {
                     "request_id": request_id,
-                    "delta":      delta,
-                    "full_text":  full_text,
+                    "delta":      _safe_delta,
+                    "full_text":  full_text[:_safe_emit_end],
                     "num_tokens": n_tokens,
                     "elapsed":    round(elapsed, 3),
                     "ttft":       round(ttft, 3),
@@ -1190,9 +1217,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     if _think_started and not _think_ended:
                         _logger.debug(
                             "[%s][THINK_TAIL] finished=%s n_tokens=%d "
-                            "full_text_tail=%r delta=%r",
+                            "full_text_tail=%r safe_delta=%r",
                             request_id, output.finished, n_tokens,
-                            full_text[-30:], delta,
+                            full_text[-30:], _safe_delta,
                         )
                     _logger.debug(
                         "[%s][EMIT token] finished=%s n_tokens=%d "
@@ -1204,8 +1231,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         token_payload.get('full_text', '')[-30:],
                     )
 
-                await sio.emit("token", token_payload, to=sid)
-                prev_text = full_text
+                if _safe_delta or output.finished:
+                    await sio.emit("token", token_payload, to=sid)
+                prev_text = full_text[:_safe_emit_end]
 
         # NOTE: _t_first_response_token may be None when no response token was
         # produced (e.g. listen decision, thinking burnout, pure EOS).  The
