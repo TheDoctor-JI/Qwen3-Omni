@@ -204,11 +204,11 @@ def _load_model_processor(args):
     engine_args = AsyncEngineArgs(
         model=args.checkpoint_path,
         trust_remote_code=True,
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=0.7,
         tensor_parallel_size=torch.cuda.device_count(),
         limit_mm_per_prompt={'image': limit_image, 'video': limit_video, 'audio': limit_audio},
         max_num_seqs=max_num_seqs,
-        max_model_len=65535,
+        max_model_len=32768,
         seed=1234,
         enable_prefix_caching=enable_prefix_cache,
     )
