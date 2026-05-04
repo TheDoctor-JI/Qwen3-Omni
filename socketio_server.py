@@ -791,8 +791,12 @@ async def _stream_generate(sio, sid, model, processor, payload,
     allowed_gen_duration_s = p.get('allowed_gen_duration_s', None)
     if allowed_gen_duration_s is not None:
         allowed_gen_duration_s = float(allowed_gen_duration_s)
+    max_thinking_dur = p.get('max_thinking_dur', None)
+    if max_thinking_dur is not None:
+        max_thinking_dur = float(max_thinking_dur)
     _logger.info(f"[{request_id}] Generation request from sid={sid}, thinking_mode={thinking_mode}"
-                 f"{f', allowed_gen_duration_s={allowed_gen_duration_s}' if allowed_gen_duration_s is not None else ''}")
+                 f"{f', allowed_gen_duration_s={allowed_gen_duration_s}' if allowed_gen_duration_s is not None else ''}"
+                 f"{f', max_thinking_dur={max_thinking_dur}' if max_thinking_dur is not None else ''}")
     # _logger.debug(f"[{request_id}] Incoming payload: {payload}")
 
     temp_files = []  # initialised early so finally-cleanup always works
@@ -800,6 +804,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
       return await _stream_generate_inner(
           sio, sid, model, processor, payload, session_cache,
           request_id, p, thinking_mode, allowed_gen_duration_s,
+          max_thinking_dur,
       )
     except Exception as exc:
         tb_str = traceback.format_exc()
@@ -816,7 +821,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
 async def _stream_generate_inner(sio, sid, model, processor, payload,
                                  session_cache, request_id, p,
-                                 thinking_mode, allowed_gen_duration_s):
+                                 thinking_mode, allowed_gen_duration_s,
+                                 max_thinking_dur):
     """Inner implementation of _stream_generate, wrapped by the outer
     function's top-level error safety net."""
 
@@ -876,6 +882,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "response_tokens_generated": None,
                 "max_response_tokens_reached": False,
                 "thinking_budget_burned_out": False,
+                "thinking_dur_exceeded": False,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
             return
@@ -918,6 +925,24 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             _effective_max_thinking = max_thinking_tokens
             _logger.info(
                 f"[{request_id}] max_thinking_tokens enforcement active: cap={max_thinking_tokens}"
+            )
+
+    # Determine effective max_thinking_dur (wall-clock duration cap on the thinking phase).
+    # Active only when: value is not None AND thinking is enabled AND model is not instruct-only.
+    _effective_max_thinking_dur = None
+    if max_thinking_dur is not None:
+        if not thinking_mode:
+            _logger.warning(
+                f"[{request_id}] max_thinking_dur={max_thinking_dur} ignored: thinking_mode=False"
+            )
+        elif _MODEL_IS_INSTRUCT:
+            _logger.warning(
+                f"[{request_id}] max_thinking_dur={max_thinking_dur} ignored: instruct model"
+            )
+        else:
+            _effective_max_thinking_dur = max_thinking_dur
+            _logger.info(
+                f"[{request_id}] max_thinking_dur enforcement active: cap={max_thinking_dur}s"
             )
 
     # Notify client which items are confirmed in the encoding cache.
@@ -968,12 +993,14 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     _t_first_response_token = None
     _think_started = False
     _think_ended   = False
+    _t_think_start = None   # elapsed when thinking block started (for max_thinking_dur)
     _t_think_end   = None   # elapsed when </think> was first detected
     _n_tokens_at_think_end = None  # token count when </think> detected
     _max_response_tokens_reached = False
     _thinking_budget_burned_out = False
     _thinking_abort_word_detected = False
     _thinking_abort_word_match: Optional[str] = None
+    _thinking_dur_exceeded = False
     _gen_timed_out = False
 
     # Delta-thinking prefix: if the client sent a non-empty thinking_prefix
@@ -982,6 +1009,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     _thinking_prefix = str(p.get('thinking_prefix', '') or '')
     if _thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT:
         _think_started = True
+        _t_think_start = 0.0  # generation begins inside an open <think> block
         _logger.info(f"[{request_id}] Delta-thinking mode: _think_started pre-set to True")
 
     try:
@@ -1022,6 +1050,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 # Detect thinking block transitions and log them
                 if not _think_started and open_tag in full_text:
                     _think_started = True
+                    _t_think_start = elapsed
                     _logger.info(f"[{request_id}] Thinking block STARTED — model is reasoning")
                 if _think_started and not _think_ended and close_tag in full_text:
                     _think_ended = True
@@ -1046,6 +1075,25 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     _logger.info(
                         f"[{request_id}] max_thinking_tokens cap reached: "
                         f"{n_tokens} >= {_effective_max_thinking}, aborting generation"
+                    )
+                    await model.abort(request_id)
+                    break
+
+                # Enforce max_thinking_dur cap.
+                # While still inside the thinking block, if wall-clock time since
+                # thinking started exceeds the budget, abort generation and flag it.
+                if (
+                    _effective_max_thinking_dur is not None
+                    and _think_started
+                    and not _think_ended
+                    and _t_think_start is not None
+                    and elapsed - _t_think_start >= _effective_max_thinking_dur
+                ):
+                    _thinking_dur_exceeded = True
+                    _logger.info(
+                        f"[{request_id}] max_thinking_dur cap reached: "
+                        f"elapsed_in_think={elapsed - _t_think_start:.3f}s >= {_effective_max_thinking_dur}s, "
+                        f"aborting generation"
                     )
                     await model.abort(request_id)
                     break
@@ -1209,6 +1257,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     "thinking_budget_burned_out": _thinking_budget_burned_out,
                     "thinking_abort_word_detected": _thinking_abort_word_detected,
                     "thinking_abort_word_match": _thinking_abort_word_match,
+                    "thinking_dur_exceeded": _thinking_dur_exceeded,
                   })
 
                 if STREAM_TRACE:
@@ -1367,6 +1416,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_budget_burned_out": _thinking_budget_burned_out,
                 "thinking_abort_word_detected": _thinking_abort_word_detected,
                 "thinking_abort_word_match": _thinking_abort_word_match,
+                "thinking_dur_exceeded": _thinking_dur_exceeded,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
         else:
@@ -1408,6 +1458,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_budget_burned_out": _thinking_budget_burned_out,
                 "thinking_abort_word_detected": _thinking_abort_word_detected,
                 "thinking_abort_word_match": _thinking_abort_word_match,
+                "thinking_dur_exceeded": _thinking_dur_exceeded,
             }, to=sid)
 
     except asyncio.CancelledError:
@@ -1474,6 +1525,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             "thinking_budget_burned_out": _thinking_budget_burned_out,
             "thinking_abort_word_detected": _thinking_abort_word_detected,
             "thinking_abort_word_match": _thinking_abort_word_match,
+            "thinking_dur_exceeded": _thinking_dur_exceeded,
         }, to=sid)
 
     except Exception as exc:
