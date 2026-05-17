@@ -98,7 +98,7 @@ _logger = logging.getLogger('socketio_server')
 # _stream_generate_inner.  Covers every vLLM output item and every
 # Socket.IO event emitted to the client.  Flip to False for production.
 # Can also be overridden at startup via --stream-trace CLI flag.
-STREAM_TRACE: bool = True
+STREAM_TRACE: bool = False
 
 os.environ['VLLM_USE_V1'] = '0'
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
