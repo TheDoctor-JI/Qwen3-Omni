@@ -657,6 +657,12 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
 
     thinking_prefix = str(p.get("thinking_prefix", "") or "")
     _use_delta_thinking = bool(thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT)
+    # Response-prefix mode: inject accumulated thinking prefix as the start of the
+    # assistant's response (no open think block).  Active when thinking_prefix is
+    # non-empty but thinking_mode is False.  The Qwen3 chat template will emit
+    # "<think>\n\n</think>\n\n" before the assistant content; with
+    # continue_final_message=True the model continues from {prefix_text}.
+    _use_response_prefix = bool(thinking_prefix and not thinking_mode and not _MODEL_IS_INSTRUCT)
 
     thinking_block_injection = str(p.get("thinking_block_injection", "") or "")
     # Mutual exclusion: thinking_prefix (open block) wins over thinking_block_injection (closed block).
@@ -708,6 +714,17 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
             f"using continue_final_message=True"
         )
 
+    if _use_response_prefix:
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": thinking_prefix}],
+        })
+        _logger.info(
+            f"[{request_id}] Response-prefix injected "
+            f"({len(thinking_prefix)} chars); "
+            f"using continue_final_message=True (thinking_mode=False)"
+        )
+
     if _use_block_injection:
         # Do NOT append to messages or use continue_final_message=True.
         # apply_chat_template hangs when continue_final_message=True is combined with
@@ -717,7 +734,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         # We then append the closed block directly to the prompt string.
         pass
 
-    _use_continue = _use_delta_thinking  # block injection is handled via manual string appending
+    _use_continue = _use_delta_thinking or _use_response_prefix  # block injection is handled via manual string appending
     prompt_text = processor.apply_chat_template(
         messages,
         tokenize=False,
