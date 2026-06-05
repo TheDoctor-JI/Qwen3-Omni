@@ -1201,9 +1201,18 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 ):
                     _think_open_pos = full_text.find(open_tag)
                     _think_close_pos = full_text.find(close_tag)
-                    _think_text = full_text[_think_open_pos + len(open_tag):] if _think_open_pos >= 0 else ""
-                    if _think_close_pos >= 0:
-                        _think_text = full_text[_think_open_pos + len(open_tag):_think_close_pos]
+                    if _think_open_pos >= 0:
+                        _end = _think_close_pos if _think_close_pos >= 0 else None
+                        _think_text = full_text[_think_open_pos + len(open_tag):_end]
+                    elif _think_close_pos >= 0:
+                        # <think> was in prompt/prefill, </think> in generated text.
+                        _think_text = full_text[:_think_close_pos]
+                    elif _think_started:
+                        # <think> was in prompt/prefill, </think> not yet emitted —
+                        # the entire generated text so far is think content.
+                        _think_text = full_text
+                    else:
+                        _think_text = ""
                     _looping_next_check_at_tokens = n_tokens + 8
                     _looping_last_check_elapsed = elapsed
                     # Use trailing window only — prevents prefix masking.
@@ -1238,7 +1247,16 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     # Fallback: run even if token count hasn't advanced
                     # enough, as long as 500 ms have elapsed since last check.
                     _think_open_pos = full_text.find(open_tag)
-                    _think_text = full_text[_think_open_pos + len(open_tag):] if _think_open_pos >= 0 else ""
+                    _think_close_pos = full_text.find(close_tag)
+                    if _think_open_pos >= 0:
+                        _end = _think_close_pos if _think_close_pos >= 0 else None
+                        _think_text = full_text[_think_open_pos + len(open_tag):_end]
+                    elif _think_close_pos >= 0:
+                        _think_text = full_text[:_think_close_pos]
+                    elif _think_started:
+                        _think_text = full_text
+                    else:
+                        _think_text = ""
                     _looping_next_check_at_tokens = n_tokens + 8
                     _looping_last_check_elapsed = elapsed
                     _trail = _think_text[-_looping_trailing_window_chars:] if len(_think_text) > _looping_trailing_window_chars else _think_text
