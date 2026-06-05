@@ -1025,16 +1025,21 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     #         0.20-0.40  heavy phrasal repetition
     #         0.00-0.10  same phrases cycling
     #         0.00       every 4-word window identical
+    #   looping_trailing_window_chars : int — only the last N chars of the
+    #       generated think text are inspected.  This prevents the thinking
+    #       prefix (accumulated prior context) from masking new looping.
     _enable_looping_detection = bool(p.get('enable_looping_detection', False))
     _abort_at_looping = bool(p.get('abort_at_looping', False))
     _looping_compression_ratio_threshold = float(p.get('looping_compression_ratio_threshold', 0.35))
     _looping_ngram_uniqueness_threshold = float(p.get('looping_ngram_uniqueness_threshold', 0.30))
+    _looping_trailing_window_chars = int(p.get('looping_trailing_window_chars', 1024))
     if _enable_looping_detection:
         _logger.info(
             f"[{request_id}] looping_detection active: "
             f"abort_at_looping={_abort_at_looping}, "
             f"compression_ratio_threshold={_looping_compression_ratio_threshold}, "
-            f"ngram_uniqueness_threshold={_looping_ngram_uniqueness_threshold}"
+            f"ngram_uniqueness_threshold={_looping_ngram_uniqueness_threshold}, "
+            f"trailing_window_chars={_looping_trailing_window_chars}"
         )
     else:
         _logger.debug(
@@ -1185,6 +1190,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 #   (a) zlib compression ratio — catches structural repetition
                 #   (b) word-level 4-gram uniqueness — catches phrasal looping
                 # Either crossing its threshold triggers detection (OR logic).
+                # Only the trailing window (last N chars of generated think
+                # text) is inspected to prevent accumulated prefix context
+                # from masking new looping.
                 if (
                     _enable_looping_detection
                     and _think_started
@@ -1198,9 +1206,11 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         _think_text = full_text[_think_open_pos + len(open_tag):_think_close_pos]
                     _looping_next_check_at_tokens = n_tokens + 8
                     _looping_last_check_elapsed = elapsed
-                    if len(_think_text) >= 200:
-                        _comp_ratio = _compression_looping_score(_think_text)
-                        _ngram_uniq = _ngram_uniqueness(_think_text)
+                    # Use trailing window only — prevents prefix masking.
+                    _trail = _think_text[-_looping_trailing_window_chars:] if len(_think_text) > _looping_trailing_window_chars else _think_text
+                    if len(_trail) >= 200:
+                        _comp_ratio = _compression_looping_score(_trail)
+                        _ngram_uniq = _ngram_uniqueness(_trail)
                         if (_comp_ratio < _looping_compression_ratio_threshold
                                 or _ngram_uniq < _looping_ngram_uniqueness_threshold):
                             _thinking_looping_detected = True
@@ -1210,7 +1220,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                                 f"[{request_id}] looping_detected: "
                                 f"compression_ratio={_comp_ratio:.3f} (thresh={_looping_compression_ratio_threshold}) "
                                 f"ngram_uniqueness={_ngram_uniq:.3f} (thresh={_looping_ngram_uniqueness_threshold}) "
-                                f"think_chars={len(_think_text)}"
+                                f"trail_chars={len(_trail)} think_chars={len(_think_text)}"
                             )
                             if _abort_at_looping:
                                 _logger.info(
@@ -1231,9 +1241,10 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     _think_text = full_text[_think_open_pos + len(open_tag):] if _think_open_pos >= 0 else ""
                     _looping_next_check_at_tokens = n_tokens + 8
                     _looping_last_check_elapsed = elapsed
-                    if len(_think_text) >= 200:
-                        _comp_ratio = _compression_looping_score(_think_text)
-                        _ngram_uniq = _ngram_uniqueness(_think_text)
+                    _trail = _think_text[-_looping_trailing_window_chars:] if len(_think_text) > _looping_trailing_window_chars else _think_text
+                    if len(_trail) >= 200:
+                        _comp_ratio = _compression_looping_score(_trail)
+                        _ngram_uniq = _ngram_uniqueness(_trail)
                         if (_comp_ratio < _looping_compression_ratio_threshold
                                 or _ngram_uniq < _looping_ngram_uniqueness_threshold):
                             _thinking_looping_detected = True
@@ -1243,7 +1254,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                                 f"[{request_id}] looping_detected (time-throttle fallback): "
                                 f"compression_ratio={_comp_ratio:.3f} (thresh={_looping_compression_ratio_threshold}) "
                                 f"ngram_uniqueness={_ngram_uniq:.3f} (thresh={_looping_ngram_uniqueness_threshold}) "
-                                f"think_chars={len(_think_text)}"
+                                f"trail_chars={len(_trail)} think_chars={len(_think_text)}"
                             )
                             if _abort_at_looping:
                                 _logger.info(
