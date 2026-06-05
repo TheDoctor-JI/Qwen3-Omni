@@ -83,6 +83,7 @@ import threading
 import time
 import traceback
 import uuid
+import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -1003,6 +1004,50 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             f"[{request_id}] thinking_abort_word_list: empty — abort-word detection disabled"
         )
 
+    # Looping detection parameters — all default to off.
+    #   enable_looping_detection : bool — when True, the server runs
+    #       programmatic looping detection on the accumulated thinking text.
+    #   abort_at_looping : bool — when True AND looping is detected, the
+    #       server aborts vLLM immediately (same as budget burnout).  When
+    #       False, detection still runs and flags are set, but generation
+    #       is allowed to continue to natural completion.
+    #   looping_compression_ratio_threshold : float — trigger when zlib
+    #       compression ratio drops below this value.  Interpretation:
+    #         0.45-0.55  normal diverse text
+    #         0.30-0.40  mild looping
+    #         0.15-0.30  severe looping
+    #         0.00-0.10  near-exact repetition
+    #         ~0.01      exact verbatim repetition
+    #   looping_ngram_uniqueness_threshold : float — trigger when 4-gram
+    #       word-level uniqueness ratio drops below this value.
+    #         0.80-1.00  normal diverse reasoning
+    #         0.50-0.70  borderline
+    #         0.20-0.40  heavy phrasal repetition
+    #         0.00-0.10  same phrases cycling
+    #         0.00       every 4-word window identical
+    _enable_looping_detection = bool(p.get('enable_looping_detection', False))
+    _abort_at_looping = bool(p.get('abort_at_looping', False))
+    _looping_compression_ratio_threshold = float(p.get('looping_compression_ratio_threshold', 0.35))
+    _looping_ngram_uniqueness_threshold = float(p.get('looping_ngram_uniqueness_threshold', 0.30))
+    if _enable_looping_detection:
+        _logger.info(
+            f"[{request_id}] looping_detection active: "
+            f"abort_at_looping={_abort_at_looping}, "
+            f"compression_ratio_threshold={_looping_compression_ratio_threshold}, "
+            f"ngram_uniqueness_threshold={_looping_ngram_uniqueness_threshold}"
+        )
+    else:
+        _logger.debug(
+            f"[{request_id}] looping_detection: disabled"
+        )
+
+    # Looping detection throttle: run at most every N tokens (gets reset on
+    # each detection run, regardless of outcome).  Initialised to force the
+    # first eligible check early.
+    _looping_next_check_at_tokens = 8
+    _looping_last_check_elapsed = 0.0  # perf_counter elapsed at last check
+    _looping_check_min_interval_s = 0.5  # fallback throttle: 500 ms
+
     t_start      = time.perf_counter()
     prev_text    = ""
     n_tokens     = 0
@@ -1019,6 +1064,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     _thinking_abort_word_match: Optional[str] = None
     _thinking_dur_exceeded = False
     _gen_timed_out = False
+    _thinking_looping_detected = False
+    _thinking_looping_compression_ratio: Optional[float] = None
+    _thinking_looping_ngram_uniqueness: Optional[float] = None
 
     # Delta-thinking prefix: if the client sent a non-empty thinking_prefix
     # with thinking enabled on a thinking-capable model, generation starts
@@ -1130,6 +1178,79 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         )
                         await model.abort(request_id)
                         break
+
+                # ---- Programmatic looping detection ----
+                # Runs inside the open thinking block, throttled to every 8
+                # tokens (or every 500 ms).  Two independent algorithms:
+                #   (a) zlib compression ratio — catches structural repetition
+                #   (b) word-level 4-gram uniqueness — catches phrasal looping
+                # Either crossing its threshold triggers detection (OR logic).
+                if (
+                    _enable_looping_detection
+                    and _think_started
+                    and not _think_ended
+                    and n_tokens >= _looping_next_check_at_tokens
+                ):
+                    _think_open_pos = full_text.find(open_tag)
+                    _think_close_pos = full_text.find(close_tag)
+                    _think_text = full_text[_think_open_pos + len(open_tag):] if _think_open_pos >= 0 else ""
+                    if _think_close_pos >= 0:
+                        _think_text = full_text[_think_open_pos + len(open_tag):_think_close_pos]
+                    _looping_next_check_at_tokens = n_tokens + 8
+                    _looping_last_check_elapsed = elapsed
+                    if len(_think_text) >= 200:
+                        _comp_ratio = _compression_looping_score(_think_text)
+                        _ngram_uniq = _ngram_uniqueness(_think_text)
+                        if (_comp_ratio < _looping_compression_ratio_threshold
+                                or _ngram_uniq < _looping_ngram_uniqueness_threshold):
+                            _thinking_looping_detected = True
+                            _thinking_looping_compression_ratio = _comp_ratio
+                            _thinking_looping_ngram_uniqueness = _ngram_uniq
+                            _logger.warning(
+                                f"[{request_id}] looping_detected: "
+                                f"compression_ratio={_comp_ratio:.3f} (thresh={_looping_compression_ratio_threshold}) "
+                                f"ngram_uniqueness={_ngram_uniq:.3f} (thresh={_looping_ngram_uniqueness_threshold}) "
+                                f"think_chars={len(_think_text)}"
+                            )
+                            if _abort_at_looping:
+                                _logger.info(
+                                    f"[{request_id}] looping_detected + abort_at_looping: aborting vLLM"
+                                )
+                                await model.abort(request_id)
+                                break
+                elif (
+                    _enable_looping_detection
+                    and _think_started
+                    and not _think_ended
+                    and len(full_text) >= 200
+                    and elapsed - _looping_last_check_elapsed >= _looping_check_min_interval_s
+                ):
+                    # Fallback: run even if token count hasn't advanced
+                    # enough, as long as 500 ms have elapsed since last check.
+                    _think_open_pos = full_text.find(open_tag)
+                    _think_text = full_text[_think_open_pos + len(open_tag):] if _think_open_pos >= 0 else ""
+                    _looping_next_check_at_tokens = n_tokens + 8
+                    _looping_last_check_elapsed = elapsed
+                    if len(_think_text) >= 200:
+                        _comp_ratio = _compression_looping_score(_think_text)
+                        _ngram_uniq = _ngram_uniqueness(_think_text)
+                        if (_comp_ratio < _looping_compression_ratio_threshold
+                                or _ngram_uniq < _looping_ngram_uniqueness_threshold):
+                            _thinking_looping_detected = True
+                            _thinking_looping_compression_ratio = _comp_ratio
+                            _thinking_looping_ngram_uniqueness = _ngram_uniq
+                            _logger.warning(
+                                f"[{request_id}] looping_detected (time-throttle fallback): "
+                                f"compression_ratio={_comp_ratio:.3f} (thresh={_looping_compression_ratio_threshold}) "
+                                f"ngram_uniqueness={_ngram_uniq:.3f} (thresh={_looping_ngram_uniqueness_threshold}) "
+                                f"think_chars={len(_think_text)}"
+                            )
+                            if _abort_at_looping:
+                                _logger.info(
+                                    f"[{request_id}] looping_detected + abort_at_looping: aborting vLLM"
+                                )
+                                await model.abort(request_id)
+                                break
 
                 # Abort-word watchlist enforcement.  Only active inside an
                 # open thinking block.  Scan `full_text` for the earliest
@@ -1275,6 +1396,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     "thinking_abort_word_detected": _thinking_abort_word_detected,
                     "thinking_abort_word_match": _thinking_abort_word_match,
                     "thinking_dur_exceeded": _thinking_dur_exceeded,
+                    "thinking_looping_detected": _thinking_looping_detected,
+                    "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
+                    "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
                   })
 
                 if STREAM_TRACE:
@@ -1434,6 +1558,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_abort_word_detected": _thinking_abort_word_detected,
                 "thinking_abort_word_match": _thinking_abort_word_match,
                 "thinking_dur_exceeded": _thinking_dur_exceeded,
+                "thinking_looping_detected": _thinking_looping_detected,
+                "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
+                "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
         else:
@@ -1476,6 +1603,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_abort_word_detected": _thinking_abort_word_detected,
                 "thinking_abort_word_match": _thinking_abort_word_match,
                 "thinking_dur_exceeded": _thinking_dur_exceeded,
+                "thinking_looping_detected": _thinking_looping_detected,
+                "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
+                "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
             }, to=sid)
 
     except asyncio.CancelledError:
@@ -1543,6 +1673,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             "thinking_abort_word_detected": _thinking_abort_word_detected,
             "thinking_abort_word_match": _thinking_abort_word_match,
             "thinking_dur_exceeded": _thinking_dur_exceeded,
+            "thinking_looping_detected": _thinking_looping_detected,
+            "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
+            "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
         }, to=sid)
 
     except Exception as exc:
@@ -1559,6 +1692,53 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 os.unlink(path)
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Programmatic looping detection
+# ---------------------------------------------------------------------------
+
+def _compression_looping_score(text: str) -> float:
+    """Return the zlib compression ratio for *text*.
+
+    Metric: len(zlib.compress(text, level=1)) / len(text.encode('utf-8'))
+
+    Uses zlib level=1 (fastest) for minimal overhead.  C-backed, O(n).
+    Lower values indicate more repetition:
+
+        0.45-0.55  normal diverse text
+        0.30-0.40  mild looping / noticeable repetition
+        0.15-0.30  severe looping / template-like repetition
+        0.00-0.10  near-exact repetition (same sentence/phrase repeated)
+        ~0.01      exact verbatim repetition of the same block
+    """
+    if not text or len(text) < 100:
+        return 1.0
+    raw = text.encode('utf-8')
+    compressed = zlib.compress(raw, level=1)
+    return len(compressed) / len(raw)
+
+
+def _ngram_uniqueness(text: str, n: int = 4) -> float:
+    """Return the ratio of unique word-level n-grams to total n-grams.
+
+    Uses word-level (not character-level) n-grams with n=4 by default.
+    O(n) time, O(unique_ngrams) space.  Lower values indicate more repetition:
+
+        0.80-1.00  normal diverse reasoning
+        0.50-0.70  some repetition, borderline
+        0.20-0.40  heavy phrasal repetition
+        0.00-0.10  same few phrases cycling repeatedly
+        0.00       every n-word window is identical (all sentences the same)
+    """
+    words = text.split()
+    if len(words) < n:
+        return 1.0
+    seen: set = set()
+    total = len(words) - n + 1
+    for i in range(total):
+        seen.add(tuple(words[i:i + n]))
+    return len(seen) / total
 
 
 # ---------------------------------------------------------------------------
