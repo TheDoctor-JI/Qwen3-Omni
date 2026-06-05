@@ -1050,8 +1050,6 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     # each detection run, regardless of outcome).  Initialised to force the
     # first eligible check early.
     _looping_next_check_at_tokens = 8
-    _looping_last_check_elapsed = 0.0  # perf_counter elapsed at last check
-    _looping_check_min_interval_s = 0.5  # fallback throttle: 500 ms
 
     t_start      = time.perf_counter()
     prev_text    = ""
@@ -1186,7 +1184,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
 
                 # ---- Programmatic looping detection ----
                 # Runs inside the open thinking block, throttled to every 8
-                # tokens (or every 500 ms).  Two independent algorithms:
+                # tokens.  Two independent algorithms:
                 #   (a) zlib compression ratio — catches structural repetition
                 #   (b) word-level 4-gram uniqueness — catches phrasal looping
                 # Either crossing its threshold triggers detection (OR logic).
@@ -1214,7 +1212,6 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     else:
                         _think_text = ""
                     _looping_next_check_at_tokens = n_tokens + 8
-                    _looping_last_check_elapsed = elapsed
                     # Use trailing window only — prevents prefix masking.
                     _trail = _think_text[-_looping_trailing_window_chars:] if len(_think_text) > _looping_trailing_window_chars else _think_text
                     if len(_trail) >= 200:
@@ -1227,49 +1224,6 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                             _thinking_looping_ngram_uniqueness = _ngram_uniq
                             _logger.warning(
                                 f"[{request_id}] looping_detected: "
-                                f"compression_ratio={_comp_ratio:.3f} (thresh={_looping_compression_ratio_threshold}) "
-                                f"ngram_uniqueness={_ngram_uniq:.3f} (thresh={_looping_ngram_uniqueness_threshold}) "
-                                f"trail_chars={len(_trail)} think_chars={len(_think_text)}"
-                            )
-                            if _abort_at_looping:
-                                _logger.info(
-                                    f"[{request_id}] looping_detected + abort_at_looping: aborting vLLM"
-                                )
-                                await model.abort(request_id)
-                                break
-                elif (
-                    _enable_looping_detection
-                    and _think_started
-                    and not _think_ended
-                    and len(full_text) >= 200
-                    and elapsed - _looping_last_check_elapsed >= _looping_check_min_interval_s
-                ):
-                    # Fallback: run even if token count hasn't advanced
-                    # enough, as long as 500 ms have elapsed since last check.
-                    _think_open_pos = full_text.find(open_tag)
-                    _think_close_pos = full_text.find(close_tag)
-                    if _think_open_pos >= 0:
-                        _end = _think_close_pos if _think_close_pos >= 0 else None
-                        _think_text = full_text[_think_open_pos + len(open_tag):_end]
-                    elif _think_close_pos >= 0:
-                        _think_text = full_text[:_think_close_pos]
-                    elif _think_started:
-                        _think_text = full_text
-                    else:
-                        _think_text = ""
-                    _looping_next_check_at_tokens = n_tokens + 8
-                    _looping_last_check_elapsed = elapsed
-                    _trail = _think_text[-_looping_trailing_window_chars:] if len(_think_text) > _looping_trailing_window_chars else _think_text
-                    if len(_trail) >= 200:
-                        _comp_ratio = _compression_looping_score(_trail)
-                        _ngram_uniq = _ngram_uniqueness(_trail)
-                        if (_comp_ratio < _looping_compression_ratio_threshold
-                                or _ngram_uniq < _looping_ngram_uniqueness_threshold):
-                            _thinking_looping_detected = True
-                            _thinking_looping_compression_ratio = _comp_ratio
-                            _thinking_looping_ngram_uniqueness = _ngram_uniq
-                            _logger.warning(
-                                f"[{request_id}] looping_detected (time-throttle fallback): "
                                 f"compression_ratio={_comp_ratio:.3f} (thresh={_looping_compression_ratio_threshold}) "
                                 f"ngram_uniqueness={_ngram_uniq:.3f} (thresh={_looping_ngram_uniqueness_threshold}) "
                                 f"trail_chars={len(_trail)} think_chars={len(_think_text)}"
