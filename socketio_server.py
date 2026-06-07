@@ -1077,6 +1077,35 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     _thinking_looping_compression_ratio: Optional[float] = None
     _thinking_looping_ngram_uniqueness: Optional[float] = None
 
+    # ── Similarity abort: word-level n-gram Jaccard against prior derivations ──
+    _enable_similarity_abort = bool(p.get('abort_at_similarity_with_prior_derivations', False))
+    _similarity_ref_text = str(p.get('similarity_abort_reference_text', '') or '')
+    _sim_trailing_chars = int(p.get('similarity_abort_trailing_chars', 1024))
+    _sim_ngram_n = int(p.get('similarity_abort_ngram_n', 4))
+    _sim_jaccard_threshold = float(p.get('similarity_abort_jaccard_threshold', 0.45))
+    _sim_check_every_n = int(p.get('similarity_abort_check_every_n_tokens', 12))
+    _sim_next_check_at_tokens = _sim_check_every_n
+    _thinking_similarity_abort_detected = False
+    _thinking_similarity_abort_jaccard: Optional[float] = None
+    # Pre-compute reference n-grams once
+    _ref_words: List[str] = []
+    _ref_ngrams: set = set()
+    if _enable_similarity_abort and _similarity_ref_text.strip():
+        _ref_words = _similarity_ref_text.split()
+        if len(_ref_words) >= _sim_ngram_n:
+            _ref_ngrams = set(
+                tuple(_ref_words[i:i + _sim_ngram_n])
+                for i in range(len(_ref_words) - _sim_ngram_n + 1)
+            )
+        _logger.info(
+            f"[{request_id}] similarity_abort active: "
+            f"ref_words={len(_ref_words)} ref_ngrams={len(_ref_ngrams)} "
+            f"ngram_n={_sim_ngram_n} trailing_chars={_sim_trailing_chars} "
+            f"jaccard_threshold={_sim_jaccard_threshold}"
+        )
+    elif _enable_similarity_abort:
+        _logger.debug(f"[{request_id}] similarity_abort: reference text empty — disabled")
+
     # Delta-thinking prefix: if the client sent a non-empty thinking_prefix
     # with thinking enabled on a thinking-capable model, generation starts
     # inside an already-open <think> block.
@@ -1248,6 +1277,56 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     if _thinking_looping_detected and _abort_at_looping:
                         break  # exit token loop after abort
 
+                # ── Similarity-based abort: word-level n-gram Jaccard against
+                # prior tool-call derivation rows.  When the trailing chars of
+                # generated thinking text are Jaccard-similar (word N-gram) to
+                # the reference text above a threshold, abort vLLM early.
+                # Throttled to every _sim_check_every_n tokens.
+                if (
+                    _enable_similarity_abort
+                    and _ref_ngrams
+                    and _think_started
+                    and not _think_ended
+                    and n_tokens >= _sim_next_check_at_tokens
+                ):
+                    _sim_next_check_at_tokens = n_tokens + _sim_check_every_n
+                    # Extract the trailing chars of generated think text
+                    _think_open_pos_sim = full_text.find(open_tag)
+                    _think_close_pos_sim = full_text.find(close_tag)
+                    if _think_open_pos_sim >= 0:
+                        _end_sim = _think_close_pos_sim if _think_close_pos_sim >= 0 else None
+                        _think_body = full_text[_think_open_pos_sim + len(open_tag):_end_sim]
+                    elif _think_close_pos_sim >= 0:
+                        _think_body = full_text[:_think_close_pos_sim]
+                    elif _think_started:
+                        _think_body = full_text
+                    else:
+                        _think_body = ""
+                    _trailing = _think_body[-_sim_trailing_chars:] if len(_think_body) > _sim_trailing_chars else _think_body
+                    _trail_words = _trailing.split()
+                    if len(_trail_words) >= _sim_ngram_n:
+                        _trail_ngrams = set(
+                            tuple(_trail_words[i:i + _sim_ngram_n])
+                            for i in range(len(_trail_words) - _sim_ngram_n + 1)
+                        )
+                        _intersection = _trail_ngrams & _ref_ngrams
+                        _union = _trail_ngrams | _ref_ngrams
+                        _jaccard = len(_intersection) / len(_union) if _union else 0.0
+                        if _jaccard >= _sim_jaccard_threshold:
+                            _thinking_similarity_abort_detected = True
+                            _thinking_similarity_abort_jaccard = _jaccard
+                            _logger.warning(
+                                f"[{request_id}] similarity_abort_detected: "
+                                f"jaccard={_jaccard:.3f} (thresh={_sim_jaccard_threshold}) "
+                                f"trail_words={len(_trail_words)} ref_ngrams={len(_ref_ngrams)} "
+                                f"trail_ngrams={len(_trail_ngrams)} intersection={len(_intersection)}"
+                            )
+                            _logger.info(
+                                f"[{request_id}] similarity_abort_detected: aborting vLLM"
+                            )
+                            await model.abort(request_id)
+                            break
+
                 # Abort-word watchlist enforcement.  Only active inside an
                 # open thinking block.  Scan `full_text` for the earliest
                 # occurrence (across all phrases) of any abort word that
@@ -1395,6 +1474,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     "thinking_looping_detected": _thinking_looping_detected,
                     "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
                     "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
+                    "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
+                    "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
                   })
 
                 if STREAM_TRACE:
@@ -1557,6 +1638,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_looping_detected": _thinking_looping_detected,
                 "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
                 "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
+                "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
+                "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
         else:
@@ -1602,6 +1685,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_looping_detected": _thinking_looping_detected,
                 "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
                 "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
+                "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
+                "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
             }, to=sid)
 
     except asyncio.CancelledError:
@@ -1672,6 +1757,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             "thinking_looping_detected": _thinking_looping_detected,
             "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
             "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
+            "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
+            "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
         }, to=sid)
 
     except Exception as exc:
