@@ -1077,31 +1077,27 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     _thinking_looping_compression_ratio: Optional[float] = None
     _thinking_looping_ngram_uniqueness: Optional[float] = None
 
-    # ── Similarity abort: word-level n-gram Jaccard against prior derivations ──
+    # ── Similarity abort: compression-based check against prior derivations ──
+    # Compresses reference + trailing think text together; if the compressed
+    # size barely exceeds the pre-computed reference compressed size, the
+    # trailing text is mostly rehashing the reference → abort.
     _enable_similarity_abort = bool(p.get('abort_at_similarity_with_prior_derivations', False))
     _similarity_ref_text = str(p.get('similarity_abort_reference_text', '') or '')
     _sim_trailing_chars = int(p.get('similarity_abort_trailing_chars', 1024))
-    _sim_ngram_n = int(p.get('similarity_abort_ngram_n', 4))
-    _sim_jaccard_threshold = float(p.get('similarity_abort_jaccard_threshold', 0.45))
+    _sim_compression_threshold = float(p.get('similarity_abort_compression_ratio_threshold', 0.50))
     _sim_check_every_n = int(p.get('similarity_abort_check_every_n_tokens', 12))
     _sim_next_check_at_tokens = _sim_check_every_n
     _thinking_similarity_abort_detected = False
-    _thinking_similarity_abort_jaccard: Optional[float] = None
-    # Pre-compute reference n-grams once
-    _ref_words: List[str] = []
-    _ref_ngrams: set = set()
+    _thinking_similarity_abort_compression_ratio: Optional[float] = None
+    # Pre-compute compressed reference length once (zlib level=1 for speed).
+    _ref_compressed_len: int = 0
     if _enable_similarity_abort and _similarity_ref_text.strip():
-        _ref_words = _similarity_ref_text.split()
-        if len(_ref_words) >= _sim_ngram_n:
-            _ref_ngrams = set(
-                tuple(_ref_words[i:i + _sim_ngram_n])
-                for i in range(len(_ref_words) - _sim_ngram_n + 1)
-            )
+        _ref_compressed_len = len(zlib.compress(_similarity_ref_text.encode('utf-8'), level=1))
         _logger.info(
             f"[{request_id}] similarity_abort active: "
-            f"ref_words={len(_ref_words)} ref_ngrams={len(_ref_ngrams)} "
-            f"ngram_n={_sim_ngram_n} trailing_chars={_sim_trailing_chars} "
-            f"jaccard_threshold={_sim_jaccard_threshold}"
+            f"ref_chars={len(_similarity_ref_text)} ref_compressed_len={_ref_compressed_len} "
+            f"trailing_chars={_sim_trailing_chars} "
+            f"compression_ratio_threshold={_sim_compression_threshold}"
         )
     elif _enable_similarity_abort:
         _logger.debug(f"[{request_id}] similarity_abort: reference text empty — disabled")
@@ -1277,14 +1273,15 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     if _thinking_looping_detected and _abort_at_looping:
                         break  # exit token loop after abort
 
-                # ── Similarity-based abort: word-level n-gram Jaccard against
-                # prior tool-call derivation rows.  When the trailing chars of
-                # generated thinking text are Jaccard-similar (word N-gram) to
-                # the reference text above a threshold, abort vLLM early.
+                # ── Similarity-based abort: compression-based check against
+                # prior tool-call derivation rows.  Compresses reference +
+                # trailing think text together; if the compressed size barely
+                # exceeds the reference's pre-computed compressed size, the
+                # trailing text is mostly rehashing the reference → abort.
                 # Throttled to every _sim_check_every_n tokens.
                 if (
                     _enable_similarity_abort
-                    and _ref_ngrams
+                    and _ref_compressed_len > 0
                     and _think_started
                     and not _think_ended
                     and n_tokens >= _sim_next_check_at_tokens
@@ -1303,23 +1300,28 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     else:
                         _think_body = ""
                     _trailing = _think_body[-_sim_trailing_chars:] if len(_think_body) > _sim_trailing_chars else _think_body
-                    _trail_words = _trailing.split()
-                    if len(_trail_words) >= _sim_ngram_n:
-                        _trail_ngrams = set(
-                            tuple(_trail_words[i:i + _sim_ngram_n])
-                            for i in range(len(_trail_words) - _sim_ngram_n + 1)
-                        )
-                        _intersection = _trail_ngrams & _ref_ngrams
-                        _union = _trail_ngrams | _ref_ngrams
-                        _jaccard = len(_intersection) / len(_union) if _union else 0.0
-                        if _jaccard >= _sim_jaccard_threshold:
+                    if len(_trailing) >= 100:
+                        _concat = (_similarity_ref_text + "\n" + _trailing).encode('utf-8')
+                        _concat_compressed = zlib.compress(_concat, level=1)
+                        # Redundancy ratio: how much compressed size the
+                        # trailing text adds relative to its own compressed
+                        # size.  Normalised by zlib(trailing) so that
+                        #   ~1.0  → no overlap (ref doesn't help compress
+                        #           trailing; concat ≈ ref + trail compressed)
+                        #   ~0.0  → complete overlap (trailing is a copy of
+                        #           ref; concat ≈ ref compressed)
+                        _trailing_raw = _trailing.encode('utf-8')
+                        _trailing_compressed = zlib.compress(_trailing_raw, level=1)
+                        _diff = len(_concat_compressed) - _ref_compressed_len
+                        _redundancy = _diff / len(_trailing_compressed) if _trailing_compressed else 1.0
+                        if _redundancy <= _sim_compression_threshold:
                             _thinking_similarity_abort_detected = True
-                            _thinking_similarity_abort_jaccard = _jaccard
+                            _thinking_similarity_abort_compression_ratio = _redundancy
                             _logger.warning(
                                 f"[{request_id}] similarity_abort_detected: "
-                                f"jaccard={_jaccard:.3f} (thresh={_sim_jaccard_threshold}) "
-                                f"trail_words={len(_trail_words)} ref_ngrams={len(_ref_ngrams)} "
-                                f"trail_ngrams={len(_trail_ngrams)} intersection={len(_intersection)}"
+                                f"compression_redundancy={_redundancy:.3f} (thresh={_sim_compression_threshold}) "
+                                f"trailing_chars={len(_trailing)} ref_compressed_len={_ref_compressed_len} "
+                                f"concat_compressed={len(_concat_compressed)}"
                             )
                             _logger.info(
                                 f"[{request_id}] similarity_abort_detected: aborting vLLM"
@@ -1475,7 +1477,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
                     "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
                     "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
-                    "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
+                    "thinking_similarity_abort_compression_ratio": _thinking_similarity_abort_compression_ratio,
                   })
 
                 if STREAM_TRACE:
@@ -1639,7 +1641,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
                 "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
                 "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
-                "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
+                "thinking_similarity_abort_compression_ratio": _thinking_similarity_abort_compression_ratio,
                 "allowed_gen_duration_s": allowed_gen_duration_s,
             }, to=sid)
         else:
@@ -1686,7 +1688,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
                 "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
                 "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
-                "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
+                "thinking_similarity_abort_compression_ratio": _thinking_similarity_abort_compression_ratio,
             }, to=sid)
 
     except asyncio.CancelledError:
@@ -1758,7 +1760,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             "thinking_looping_compression_ratio": _thinking_looping_compression_ratio,
             "thinking_looping_ngram_uniqueness": _thinking_looping_ngram_uniqueness,
             "thinking_similarity_abort_detected": _thinking_similarity_abort_detected,
-            "thinking_similarity_abort_jaccard": _thinking_similarity_abort_jaccard,
+            "thinking_similarity_abort_compression_ratio": _thinking_similarity_abort_compression_ratio,
         }, to=sid)
 
     except Exception as exc:
