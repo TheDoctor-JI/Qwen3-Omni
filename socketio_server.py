@@ -385,6 +385,11 @@ def _build_messages(payload):
                 out_content.append(item)
 
         if out_content:
+            # Text-only models: collapse content to plain string when all items are text.
+            if _MODEL_IS_TEXT_ONLY and all(
+                c.get("type") == "text" for c in out_content
+            ):
+                out_content = " ".join(c.get("text", "") for c in out_content)
             messages.append({"role": role, "content": out_content})
 
     return messages, temp_files, total_input_audio_duration_sec
