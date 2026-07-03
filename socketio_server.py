@@ -104,14 +104,14 @@ STREAM_TRACE: bool = False
 os.environ['VLLM_USE_V1'] = '0'
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
+DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
+
 from argparse import ArgumentParser
 import socketio
 from aiohttp import web
-from qwen_omni_utils import process_mm_info
-from transformers import Qwen3OmniMoeProcessor
-
-
-DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
+from transformers import AutoTokenizer, Qwen3OmniMoeProcessor
+if 'omni' in str(os.environ.get('SOCKETIO_MODEL_PATH', DEFAULT_CKPT_PATH)).lower():
+    from qwen_omni_utils import process_mm_info
 
 # Set during _load_model_processor; guards how many *new* (uncached) mm items
 # a single request may introduce.
@@ -119,6 +119,12 @@ _MAX_NEW_MM_PER_REQUEST: int = 20
 
 # Set during _load_model_processor; used to gate thinking-mode behavior.
 _MODEL_IS_INSTRUCT: bool = False
+
+# Set during _load_model_processor; True for text-only models (e.g. Qwen3-8B)
+# that lack multimodal encoding capabilities.  When True all MM processing
+# paths are bypassed with zero code removal — reverting to an Omni model
+# requires no changes, just a different checkpoint path.
+_MODEL_IS_TEXT_ONLY: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +218,9 @@ def _load_model_processor(args):
     ckpt_lower = str(args.checkpoint_path).lower()
     _MODEL_IS_INSTRUCT = 'instruct' in ckpt_lower
 
+    global _MODEL_IS_TEXT_ONLY
+    _MODEL_IS_TEXT_ONLY = 'omni' not in ckpt_lower
+
     model_cfg = config.get('model', {})
     max_num_seqs = int(model_cfg.get('max_num_seqs', 2))
     limit_audio = int(model_cfg.get('limit_audio_per_prompt', 10))
@@ -223,41 +232,55 @@ def _load_model_processor(args):
     max_new_mm = int(model_cfg.get('max_new_mm_per_request', 20))
     global _MAX_NEW_MM_PER_REQUEST
     _MAX_NEW_MM_PER_REQUEST = max_new_mm
-    engine_args = AsyncEngineArgs(
+    engine_args_kwargs = dict(
         model=args.checkpoint_path,
         trust_remote_code=True,
         gpu_memory_utilization=0.8,
         tensor_parallel_size=torch.cuda.device_count(),
-        limit_mm_per_prompt={'image': limit_image, 'video': limit_video, 'audio': limit_audio},
         max_num_seqs=max_num_seqs,
-        max_model_len=65535,
         seed=1234,
         enable_prefix_caching=enable_prefix_cache,
     )
+    if not _MODEL_IS_TEXT_ONLY:
+        engine_args_kwargs['limit_mm_per_prompt'] = {
+            'image': limit_image, 'video': limit_video, 'audio': limit_audio,
+        }
+        engine_args_kwargs['max_model_len'] = 65535
+    engine_args = AsyncEngineArgs(**engine_args_kwargs)
     _logger.info(
         f"max_num_seqs={max_num_seqs}, "
         f"limit_mm_per_prompt={{image:{limit_image}, video:{limit_video}, audio:{limit_audio}}}, "
         f"enable_prefix_caching={enable_prefix_cache}, max_new_mm_per_request={max_new_mm}"
     )
+    profile_label = 'text-only'
+    if _MODEL_IS_INSTRUCT:
+        profile_label = 'text-only-instruct' if _MODEL_IS_TEXT_ONLY else 'instruct'
+    elif not _MODEL_IS_TEXT_ONLY:
+        profile_label = 'omni'
     _logger.info(
-        f"Model profile detected: {'instruct' if _MODEL_IS_INSTRUCT else 'thinking/other'} "
+        f"Model profile detected: {profile_label} "
         f"(checkpoint={args.checkpoint_path})"
     )
     model = AsyncLLMEngine.from_engine_args(engine_args)
-    processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
+
+    if _MODEL_IS_TEXT_ONLY:
+        processor = AutoTokenizer.from_pretrained(args.checkpoint_path)
+    else:
+        processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
 
     # Override max audio duration from config (default: 300s = 5 min)
-    audio_cfg = config.get('audio', {})
-    max_audio_sec = audio_cfg.get('max_audio_duration_sec', None)
-    if max_audio_sec is not None:
-        max_audio_sec = int(max_audio_sec)
-        fe = processor.feature_extractor
-        fe.n_samples = max_audio_sec * fe.sampling_rate
-        fe.nb_max_frames = fe.n_samples // fe.hop_length
-        _logger.info(
-            f"Audio max duration overridden to {max_audio_sec}s "
-            f"(n_samples={fe.n_samples}, nb_max_frames={fe.nb_max_frames})"
-        )
+    if not _MODEL_IS_TEXT_ONLY:
+        audio_cfg = config.get('audio', {})
+        max_audio_sec = audio_cfg.get('max_audio_duration_sec', None)
+        if max_audio_sec is not None:
+            max_audio_sec = int(max_audio_sec)
+            fe = processor.feature_extractor
+            fe.n_samples = max_audio_sec * fe.sampling_rate
+            fe.nb_max_frames = fe.n_samples // fe.hop_length
+            _logger.info(
+                f"Audio max duration overridden to {max_audio_sec}s "
+                f"(n_samples={fe.n_samples}, nb_max_frames={fe.nb_max_frames})"
+            )
 
     return model, processor
 
@@ -319,6 +342,13 @@ def _build_messages(payload):
         for item in raw_content:
             item_type = item.get("type", "text")
 
+            # Text-only models: skip all non-text content items (audio, image, video).
+            # They have no multimodal encoder and their chat templates don't support
+            # media content.  This also makes model_warm_up safe — the client sends
+            # audio but it's silently dropped here.
+            if _MODEL_IS_TEXT_ONLY and item_type != "text":
+                continue
+
             if item_type in default_suffixes and item.get("data"):
                 # Inline base64 media — materialise to temp file
                 suffix = item.get("suffix") or default_suffixes[item_type]
@@ -360,11 +390,23 @@ def _build_messages(payload):
     return messages, temp_files, total_input_audio_duration_sec
 
 
+def _get_tokenizer(processor):
+    """Return the tokenizer object for *processor*.
+
+    For Omni models the tokenizer lives at ``processor.tokenizer``; for
+    text-only models (where *processor* is an ``AutoTokenizer`` instance)
+    the processor itself is the tokenizer.
+    """
+    if _MODEL_IS_TEXT_ONLY:
+        return processor  # AutoTokenizer IS the tokenizer
+    return getattr(processor, "tokenizer", None)
+
+
 def _count_text_tokens(processor, text: str) -> int:
     """Count text tokens with the model tokenizer."""
     if not text:
         return 0
-    tokenizer = getattr(processor, "tokenizer", None)
+    tokenizer = _get_tokenizer(processor)
     if tokenizer is None:
         return 0
     try:
@@ -620,22 +662,25 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         f"{len(temp_files)} temp files"
     )
 
-    audios, images, videos, n_new, confirmed = _process_mm_info_cached(
-        messages, session_cache, request_id,
-    )
-    _logger.info(
-        f"[{request_id}] _process_mm_info_cached: "
-        f"audios={len(audios) if audios else 0}, "
-        f"images={len(images) if images else 0}, "
-        f"videos={len(videos) if videos else 0}, "
-        f"n_new={n_new}, confirmed={len(confirmed)}"
-    )
-    if n_new > _MAX_NEW_MM_PER_REQUEST:
-        raise ValueError(
-            f"Too many new multimodal items to encode in a single request: "
-            f"{n_new} > limit {_MAX_NEW_MM_PER_REQUEST}. "
-            f"Consider reducing context window size."
+    if not _MODEL_IS_TEXT_ONLY:
+        audios, images, videos, n_new, confirmed = _process_mm_info_cached(
+            messages, session_cache, request_id,
         )
+        _logger.info(
+            f"[{request_id}] _process_mm_info_cached: "
+            f"audios={len(audios) if audios else 0}, "
+            f"images={len(images) if images else 0}, "
+            f"videos={len(videos) if videos else 0}, "
+            f"n_new={n_new}, confirmed={len(confirmed)}"
+        )
+        if n_new > _MAX_NEW_MM_PER_REQUEST:
+            raise ValueError(
+                f"Too many new multimodal items to encode in a single request: "
+                f"{n_new} > limit {_MAX_NEW_MM_PER_REQUEST}. "
+                f"Consider reducing context window size."
+            )
+    else:
+        audios, images, videos, n_new, confirmed = None, None, None, 0, []
 
     # -----------------------------------------------------------------------
     # Delta-thinking prefix support
@@ -698,7 +743,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         if _pfx.startswith(open_tag):
             _pfx = _pfx[len(open_tag):]
         assistant_content = [{"type": "text", "text": f"<think>{_pfx}"}]
-        if thinking_prefix_audio_items:
+        if not _MODEL_IS_TEXT_ONLY and thinking_prefix_audio_items:
             # Materialise base64 audio blobs to temp files so they pass through _build_messages.
             for audio_item in thinking_prefix_audio_items:
                 if isinstance(audio_item, dict) and audio_item.get("type") == "audio" and audio_item.get("data"):
@@ -736,6 +781,24 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         pass
 
     _use_continue = _use_delta_thinking or _use_response_prefix  # block injection is handled via manual string appending
+    # Text-only models: AutoTokenizer.apply_chat_template does NOT support
+    # continue_final_message.  Instead we call apply_chat_template normally
+    # (with add_generation_prompt=True) and manually append the prefix to
+    # the rendered prompt string.
+    _text_only_manual_prefix: Optional[str] = None
+    if _MODEL_IS_TEXT_ONLY and _use_continue:
+        # Save the prefix text (already validated above) and reset
+        # _use_continue so we don't pass continue_final_message to the tokenizer.
+        if _use_delta_thinking:
+            _text_only_manual_prefix = f"<think>{_pfx}"
+        elif _use_response_prefix:
+            _text_only_manual_prefix = thinking_prefix
+        _use_continue = False
+        # Remove the injected assistant messages — they were only needed for
+        # the Omni continue_final_message path.
+        if _use_delta_thinking or _use_response_prefix:
+            messages.pop()  # remove the synthetic assistant message just appended
+
     prompt_text = processor.apply_chat_template(
         messages,
         tokenize=False,
@@ -743,6 +806,14 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         **(dict(continue_final_message=True) if _use_continue else {}),
         enable_thinking=template_enable_thinking,
     )
+
+    # Text-only manual prefix: append after template rendering.
+    if _MODEL_IS_TEXT_ONLY and _text_only_manual_prefix is not None:
+        prompt_text += _text_only_manual_prefix
+        _logger.info(
+            f"[{request_id}] Text-only manual prefix appended to prompt "
+            f"({len(_text_only_manual_prefix)} chars)"
+        )
 
     if _use_block_injection:
         # Defensive strip: callers should send raw text without tags, but strip
@@ -777,12 +848,13 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
 
     inputs = {
         "prompt": prompt_text,
-        "multi_modal_data": {},
-        "mm_processor_kwargs": {"use_audio_in_video": True},
     }
-    if images is not None: inputs["multi_modal_data"]["image"] = images
-    if videos is not None: inputs["multi_modal_data"]["video"] = videos
-    if audios is not None: inputs["multi_modal_data"]["audio"] = audios
+    if not _MODEL_IS_TEXT_ONLY:
+        inputs["multi_modal_data"] = {}
+        inputs["mm_processor_kwargs"] = {"use_audio_in_video": True}
+        if images is not None: inputs["multi_modal_data"]["image"] = images
+        if videos is not None: inputs["multi_modal_data"]["video"] = videos
+        if audios is not None: inputs["multi_modal_data"]["audio"] = audios
 
     return (
       inputs,
@@ -965,7 +1037,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
 
     # Notify client which items are confirmed in the encoding cache.
     # Emitted before generation_start so the client has acks before tokens.
-    if confirmed_items:
+    # Skipped for text-only models (no multimodal encoding cache).
+    if not _MODEL_IS_TEXT_ONLY and confirmed_items:
         await sio.emit("items_cached", {
             "request_id": request_id,
             "items": confirmed_items,
@@ -1899,7 +1972,7 @@ def create_socketio_app(model, processor):
         await _abort_active(sid, "stop")
 
     @sio.on("clear_cache")
-    async def on_clear_cache(sid):
+    async def on_clear_cache(sid, data=None):
         """Wipe cached state for all sessions that are no longer connected.
 
         Safe to call from any live client.  Aborts any in-flight vLLM
@@ -1920,7 +1993,7 @@ def create_socketio_app(model, processor):
         await sio.emit("cache_cleared", to=sid)
 
     @sio.on("reset_kv_cache")
-    async def on_reset_kv_cache(sid):
+    async def on_reset_kv_cache(sid, data=None):
         """Flush vLLM's prefix KV cache.
 
         Calls AsyncLLMEngine.reset_prefix_cache(), which discards all cached
