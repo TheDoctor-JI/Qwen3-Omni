@@ -42,10 +42,13 @@ echo "============================================================"
 echo " Starting Qwen3-8B Socket.IO Server"
 echo " Checkpoint: $QWEN3_8B_PATH"
 echo " Listen:     0.0.0.0:8902"
+echo " GPU:        CUDA:1 (single GPU)"
 echo " Profile:    text-only (thinking mode supported)"
 echo "============================================================"
 
-python socketio_server.py \
+CUDA_VISIBLE_DEVICES=1 python socketio_server.py \
     --checkpoint-path "$QWEN3_8B_PATH" \
     --config "$CONFIG_PATH" \
-    --host 0.0.0.0 --port 8902
+    --host 0.0.0.0 --port 8902 \
+    --gpu-memory-utilization 0.9 \
+    --tensor-parallel-size 1

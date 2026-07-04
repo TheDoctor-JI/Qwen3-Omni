@@ -232,11 +232,28 @@ def _load_model_processor(args):
     max_new_mm = int(model_cfg.get('max_new_mm_per_request', 20))
     global _MAX_NEW_MM_PER_REQUEST
     _MAX_NEW_MM_PER_REQUEST = max_new_mm
+
+    # GPU memory / tensor-parallel settings — configurable via YAML and CLI.
+    # CLI args (when explicitly provided) take precedence over YAML config,
+    # which takes precedence over the hard-coded defaults below.
+    _gmu = float(model_cfg.get('gpu_memory_utilization', 0.8))
+    _tps = model_cfg.get('tensor_parallel_size', None)
+    if _tps is not None:
+        _tps = int(_tps)
+    else:
+        _tps = torch.cuda.device_count()
+
+    # CLI overrides (only when the user explicitly passed them)
+    if getattr(args, 'gpu_memory_utilization', None) is not None:
+        _gmu = float(args.gpu_memory_utilization)
+    if getattr(args, 'tensor_parallel_size', None) is not None:
+        _tps = int(args.tensor_parallel_size)
+
     engine_args_kwargs = dict(
         model=args.checkpoint_path,
         trust_remote_code=True,
-        gpu_memory_utilization=0.8,
-        tensor_parallel_size=torch.cuda.device_count(),
+        gpu_memory_utilization=_gmu,
+        tensor_parallel_size=_tps,
         max_num_seqs=max_num_seqs,
         seed=1234,
         enable_prefix_caching=enable_prefix_cache,
@@ -249,6 +266,7 @@ def _load_model_processor(args):
     engine_args = AsyncEngineArgs(**engine_args_kwargs)
     _logger.info(
         f"max_num_seqs={max_num_seqs}, "
+        f"gpu_memory_utilization={_gmu}, tensor_parallel_size={_tps}, "
         f"limit_mm_per_prompt={{image:{limit_image}, video:{limit_video}, audio:{limit_audio}}}, "
         f"enable_prefix_caching={enable_prefix_cache}, max_new_mm_per_request={max_new_mm}"
     )
@@ -3234,6 +3252,18 @@ def _get_args():
         "--stream-trace", action="store_true", default=False,
         help="Enable verbose per-token / per-emit DEBUG logs (STREAM_TRACE mode). "
              "Logs every vLLM output item and every Socket.IO event emitted to the client.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=None,
+        help="vLLM GPU memory utilisation ratio (0.0–1.0). "
+             "Overrides the YAML config value. "
+             "Default from config: 0.8 (Omni) — use 0.9 for 8B models.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=None,
+        help="Number of GPUs for tensor parallelism. "
+             "Overrides the YAML config value. "
+             "Default from config: auto (all GPUs) — use 1 for 8B models.",
     )
     return parser.parse_args()
 
