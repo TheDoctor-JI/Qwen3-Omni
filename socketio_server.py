@@ -236,7 +236,7 @@ def _load_model_processor(args):
     # GPU memory / tensor-parallel settings — configurable via YAML and CLI.
     # CLI args (when explicitly provided) take precedence over YAML config,
     # which takes precedence over the hard-coded defaults below.
-    _gmu = float(model_cfg.get('gpu_memory_utilization', 0.8))
+    _gmu = float(model_cfg.get('gpu_memory_utilization', 0.7))
     _tps = model_cfg.get('tensor_parallel_size', None)
     if _tps is not None:
         _tps = int(_tps)
@@ -262,7 +262,7 @@ def _load_model_processor(args):
         engine_args_kwargs['limit_mm_per_prompt'] = {
             'image': limit_image, 'video': limit_video, 'audio': limit_audio,
         }
-        engine_args_kwargs['max_model_len'] = 65535
+        engine_args_kwargs['max_model_len'] = 32768
     engine_args = AsyncEngineArgs(**engine_args_kwargs)
     _logger.info(
         f"max_num_seqs={max_num_seqs}, "
@@ -3257,7 +3257,7 @@ def _get_args():
         "--gpu-memory-utilization", type=float, default=None,
         help="vLLM GPU memory utilisation ratio (0.0–1.0). "
              "Overrides the YAML config value. "
-             "Default from config: 0.8 (Omni) — use 0.9 for 8B models.",
+             "Default from config: 0.7 (Omni) — use 0.9 for 8B models.",
     )
     parser.add_argument(
         "--tensor-parallel-size", type=int, default=None,

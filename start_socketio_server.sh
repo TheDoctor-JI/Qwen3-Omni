@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# For releasing ports - kill any existing processes on port 8902
-lsof -t -i:8902 | xargs -r kill -9 2>/dev/null || true
 
 # Also kill any lingering Qwen3-Omni / vLLM processes related to this server
 pkill -9 -f "socketio_server.py" 2>/dev/null || true
