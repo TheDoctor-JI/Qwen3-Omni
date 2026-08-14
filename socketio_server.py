@@ -71,6 +71,12 @@ Message format (inside "messages"):
     Image items: {type: "image", data: "<base64>", suffix: ".jpg"}
     Video items: {type: "video", data: "<base64>", suffix: ".mp4"}
     Roles: "system", "user", "assistant", "tool"
+
+PredGen protocol (isolated from ``generate``):
+    "pred_gen_style_generation" accepts the same messages/params plus
+    candidate_token_ids, candidate_finished, and verification_top_k.  Its
+    Socket.IO acknowledgement contains the updated opaque candidate.  It does
+    not emit ordinary generation events or enter the ordinary task map.
 """
 
 import asyncio
@@ -1926,6 +1932,352 @@ def _ngram_uniqueness(text: str, n: int = 4) -> float:
 # Socket.IO application factory
 # ---------------------------------------------------------------------------
 
+def _predgen_inputs_with_token_ids(inputs: Dict[str, Any], token_ids: List[int]) -> Dict[str, Any]:
+    """Return a vLLM prompt using exact token IDs while preserving MM data."""
+    updated = dict(inputs)
+    updated.pop("prompt", None)
+    updated["prompt_token_ids"] = list(token_ids)
+    return updated
+
+
+def _predgen_candidate_rank(logprob_entry: Any, token_id: int) -> Optional[int]:
+    """Read one candidate token's rank from a vLLM prompt-logprob entry."""
+    if not isinstance(logprob_entry, dict):
+        return None
+    value = logprob_entry.get(token_id)
+    if value is None:
+        value = logprob_entry.get(str(token_id))
+    rank = getattr(value, "rank", None) if value is not None else None
+    if rank is not None:
+        return int(rank)
+
+    # Compatibility fallback for older vLLM Logprob objects without ``rank``.
+    scored = []
+    for key, item in logprob_entry.items():
+        score = getattr(item, "logprob", item if isinstance(item, (int, float)) else None)
+        if score is not None:
+            scored.append((float(score), int(key)))
+    scored.sort(reverse=True)
+    for index, (_, key) in enumerate(scored, start=1):
+        if key == token_id:
+            return index
+    return None
+
+
+def _predgen_decode_candidate(processor: Any, token_ids: List[int]) -> str:
+    tokenizer = _get_tokenizer(processor)
+    if tokenizer is None:
+        raise RuntimeError("PredGen requires a tokenizer")
+    return tokenizer.decode(
+        list(token_ids),
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+
+
+def _predgen_fingerprints(model: Any, processor: Any) -> Tuple[str, str]:
+    tokenizer = _get_tokenizer(processor)
+    tokenizer_fingerprint = str(
+        getattr(tokenizer, "name_or_path", "")
+        or getattr(processor, "name_or_path", "")
+        or type(tokenizer).__name__
+    )
+    model_config = getattr(model, "model_config", None)
+    if model_config is None:
+        model_config = getattr(getattr(model, "engine", None), "model_config", None)
+    model_fingerprint = str(
+        getattr(model_config, "model", "")
+        or getattr(model_config, "model_name", "")
+        or getattr(processor, "name_or_path", "")
+        or type(model).__name__
+    )
+    return model_fingerprint, tokenizer_fingerprint
+
+
+async def _predgen_style_generation(
+    model: Any,
+    processor: Any,
+    payload: Dict[str, Any],
+    session_cache: Optional[MmItemCache],
+) -> Dict[str, Any]:
+    """Verify a prior candidate by rank, then continue from its valid prefix.
+
+    This is deliberately independent of ``_stream_generate``.  The candidate
+    is an opaque token-ID sequence owned by the caller.  Verification uses
+    vLLM prompt log-probabilities and retains the longest prefix whose tokens
+    all have rank <= ``verification_top_k``.
+    """
+    request_id = str(payload.get("request_id") or uuid.uuid4())
+    params = payload.get("params") or {}
+    verification_top_k = int(payload.get("verification_top_k", 3))
+    if verification_top_k < 1:
+        raise ValueError("verification_top_k must be at least 1")
+
+    raw_candidate = payload.get("candidate_token_ids") or []
+    if not isinstance(raw_candidate, list):
+        raise ValueError("candidate_token_ids must be a list")
+    candidate_token_ids = [int(token_id) for token_id in raw_candidate]
+    if len(candidate_token_ids) > 65536:
+        raise ValueError("candidate_token_ids exceeds the 65536-token safety limit")
+
+    tokenizer = _get_tokenizer(processor)
+    if tokenizer is None:
+        raise RuntimeError("PredGen requires a tokenizer")
+    tokenizer_size = len(tokenizer)
+    if any(token_id < 0 or token_id >= tokenizer_size for token_id in candidate_token_ids):
+        raise ValueError("candidate_token_ids contains an out-of-vocabulary token ID")
+
+    model_fingerprint, tokenizer_fingerprint = _predgen_fingerprints(model, processor)
+    supplied_model_fingerprint = str(payload.get("candidate_model_fingerprint") or "")
+    supplied_tokenizer_fingerprint = str(payload.get("candidate_tokenizer_fingerprint") or "")
+    if candidate_token_ids and supplied_model_fingerprint != model_fingerprint:
+        raise ValueError("PredGen candidate model fingerprint does not match this server")
+    if candidate_token_ids and supplied_tokenizer_fingerprint != tokenizer_fingerprint:
+        raise ValueError("PredGen candidate tokenizer fingerprint does not match this server")
+
+    prior_finished = bool(payload.get("candidate_finished", False))
+    allowed_duration = params.get("allowed_gen_duration_s")
+    allowed_duration = float(allowed_duration) if allowed_duration is not None else None
+    if allowed_duration is not None and allowed_duration <= 0:
+        raise ValueError("allowed_gen_duration_s must be positive when provided")
+
+    started_at = time.perf_counter()
+    deadline = started_at + allowed_duration if allowed_duration is not None else None
+    temp_files: List[str] = []
+    active_engine_request_id: Optional[str] = None
+    verification_duration = 0.0
+    continuation_duration = 0.0
+    first_generated_token_at: Optional[float] = None
+    timed_out = False
+    rejection_index: Optional[int] = None
+    candidate_ranks: List[int] = []
+    verification_completed = False
+    accepted_token_ids = list(candidate_token_ids)
+    generated_token_ids: List[int] = []
+    finish_reason: Optional[str] = None
+    confirmed_items: List[dict] = []
+    input_text_tokens = 0
+    input_audio_duration_sec = 0.0
+
+    def _deadline_reached() -> bool:
+        return deadline is not None and time.perf_counter() >= deadline
+
+    try:
+        (
+            inputs,
+            sampling_params,
+            temp_files,
+            confirmed_items,
+            input_text_tokens,
+            input_audio_duration_sec,
+            _max_response_tokens,
+            _max_thinking_tokens,
+        ) = await asyncio.to_thread(_prepare_inputs, processor, payload, session_cache)
+
+        prompt_text = str(inputs.get("prompt", ""))
+        try:
+            base_prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        except TypeError:
+            base_prompt_token_ids = tokenizer.encode(prompt_text)
+        base_prompt_token_ids = [int(token_id) for token_id in base_prompt_token_ids]
+
+        if _deadline_reached():
+            timed_out = True
+        elif candidate_token_ids:
+            from vllm import SamplingParams
+
+            verify_started_at = time.perf_counter()
+            verify_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=1,
+                prompt_logprobs=verification_top_k,
+            )
+            verify_request_id = f"{request_id}:verify"
+            active_engine_request_id = verify_request_id
+            verify_output = None
+            verify_inputs = _predgen_inputs_with_token_ids(
+                inputs,
+                base_prompt_token_ids + candidate_token_ids,
+            )
+            async for output in model.generate(verify_inputs, verify_params, verify_request_id):
+                verify_output = output
+                if _deadline_reached():
+                    timed_out = True
+                    await model.abort(verify_request_id)
+                    break
+            verification_duration = time.perf_counter() - verify_started_at
+            active_engine_request_id = None
+
+            # If the forward pass did not finish, its ranks are not authoritative;
+            # preserve the incoming candidate unchanged for the next offset.
+            if verify_output is not None and getattr(verify_output, "finished", False):
+                verification_completed = True
+                prompt_logprobs = getattr(verify_output, "prompt_logprobs", None)
+                if not isinstance(prompt_logprobs, list):
+                    raise RuntimeError("vLLM did not return prompt_logprobs for PredGen verification")
+                returned_prompt_ids = getattr(verify_output, "prompt_token_ids", None)
+                if not isinstance(returned_prompt_ids, (list, tuple)):
+                    raise RuntimeError("vLLM did not return prompt_token_ids for PredGen alignment")
+                returned_prompt_ids = [int(token_id) for token_id in returned_prompt_ids]
+                if len(returned_prompt_ids) < len(candidate_token_ids):
+                    raise RuntimeError("vLLM returned fewer prompt tokens than the candidate length")
+                candidate_start = len(returned_prompt_ids) - len(candidate_token_ids)
+                if returned_prompt_ids[candidate_start:] != candidate_token_ids:
+                    raise RuntimeError("PredGen candidate is not the returned vLLM prompt suffix")
+                for offset, token_id in enumerate(candidate_token_ids):
+                    position = candidate_start + offset
+                    if position >= len(prompt_logprobs):
+                        raise RuntimeError(
+                            "vLLM prompt_logprobs was shorter than the verified prompt"
+                        )
+                    rank = _predgen_candidate_rank(prompt_logprobs[position], token_id)
+                    candidate_ranks.append(int(rank) if rank is not None else -1)
+                    if rank is None or rank > verification_top_k:
+                        rejection_index = offset
+                        accepted_token_ids = candidate_token_ids[:offset]
+                        break
+            elif not timed_out:
+                raise RuntimeError("PredGen verification ended without a finished vLLM output")
+
+        fully_accepted = rejection_index is None
+        candidate_still_finished = bool(
+            candidate_token_ids
+            and prior_finished
+            and verification_completed
+            and fully_accepted
+        )
+
+        if not timed_out and not candidate_still_finished:
+            if _deadline_reached():
+                timed_out = True
+            else:
+                continuation_started_at = time.perf_counter()
+                generation_request_id = f"{request_id}:generate"
+                active_engine_request_id = generation_request_id
+                generation_inputs = _predgen_inputs_with_token_ids(
+                    inputs,
+                    base_prompt_token_ids + accepted_token_ids,
+                )
+                final_output = None
+                async for output in model.generate(
+                    generation_inputs,
+                    sampling_params,
+                    generation_request_id,
+                ):
+                    final_output = output
+                    output_item = output.outputs[0] if output.outputs else None
+                    if output_item is not None:
+                        generated_token_ids = [
+                            int(token_id) for token_id in (output_item.token_ids or [])
+                        ]
+                        finish_reason = getattr(output_item, "finish_reason", None)
+                        if generated_token_ids and first_generated_token_at is None:
+                            first_generated_token_at = time.perf_counter()
+                    if _deadline_reached():
+                        timed_out = True
+                        await model.abort(generation_request_id)
+                        break
+                continuation_duration = time.perf_counter() - continuation_started_at
+                active_engine_request_id = None
+                if final_output is None and not timed_out:
+                    raise RuntimeError("PredGen continuation ended without a vLLM output")
+
+        updated_candidate_ids = accepted_token_ids + generated_token_ids
+        if timed_out and candidate_token_ids and not verification_completed:
+            candidate_finished = prior_finished
+        else:
+            candidate_finished = bool(
+                candidate_still_finished
+                or (
+                    not timed_out
+                    and str(finish_reason or "").lower() in {"stop", "eos"}
+                )
+            )
+        total_duration = time.perf_counter() - started_at
+        time_to_first_token = (
+            first_generated_token_at - started_at
+            if first_generated_token_at is not None
+            else None
+        )
+        generation_duration = (
+            max(0.0, total_duration - time_to_first_token)
+            if time_to_first_token is not None
+            else total_duration
+        )
+
+        return {
+            "request_id": request_id,
+            "status": "timed_out" if timed_out else "complete",
+            "candidate_token_ids": updated_candidate_ids,
+            "candidate_text": _predgen_decode_candidate(processor, updated_candidate_ids),
+            "candidate_finished": candidate_finished,
+            "candidate_model_fingerprint": model_fingerprint,
+            "candidate_tokenizer_fingerprint": tokenizer_fingerprint,
+            "prior_candidate_tokens": len(candidate_token_ids),
+            "accepted_prefix_tokens": len(accepted_token_ids),
+            "rejected_suffix_tokens": max(
+                0,
+                len(candidate_token_ids) - len(accepted_token_ids),
+            ),
+            "rejected_at_token_index": rejection_index,
+            "candidate_ranks": candidate_ranks,
+            "verification_completed": verification_completed or not candidate_token_ids,
+            "entire_candidate_accepted": (
+                not candidate_token_ids
+                or (verification_completed and rejection_index is None)
+            ),
+            "acceptance_ratio": (
+                None
+                if candidate_token_ids and not verification_completed
+                else (
+                    len(accepted_token_ids) / len(candidate_token_ids)
+                    if candidate_token_ids
+                    else 1.0
+                )
+            ),
+            "generated_tokens": len(generated_token_ids),
+            "verification_top_k": verification_top_k,
+            "finish_reason": finish_reason,
+            "confirmed_items": confirmed_items,
+            "metrics": {
+                "request_id": request_id,
+                "input_text_tokens": input_text_tokens,
+                "input_audio_duration_sec": input_audio_duration_sec,
+                "time_to_first_token": time_to_first_token,
+                "generation_duration": generation_duration,
+                "total_duration": total_duration,
+                "preprocessing_duration": max(
+                    0.0,
+                    total_duration - verification_duration - continuation_duration,
+                ),
+                "verification_duration": verification_duration,
+                "continuation_duration": continuation_duration,
+                "generated_tokens": len(generated_token_ids),
+                "candidate_tokens": len(updated_candidate_ids),
+                "allowed_gen_duration_s": allowed_duration,
+                "generation_timed_out": timed_out,
+            },
+        }
+    except asyncio.CancelledError:
+        if active_engine_request_id:
+            try:
+                await model.abort(active_engine_request_id)
+            except Exception:
+                _logger.debug(
+                    "[%s] Failed to abort cancelled PredGen engine request %s",
+                    request_id,
+                    active_engine_request_id,
+                    exc_info=True,
+                )
+        raise
+    finally:
+        for path in temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def create_socketio_app(model, processor):
     sio = socketio.AsyncServer(
         async_mode="aiohttp",
@@ -1938,6 +2290,7 @@ def create_socketio_app(model, processor):
     sio.attach(app)
 
     _active = {}   # sid -> (asyncio.Task, request_id: str)
+    _predgen_active: Dict[str, asyncio.Task] = {}  # isolated from ordinary generation
     _session_caches: Dict[str, MmItemCache] = {}  # sid -> per-session encoding cache
     _connected_sids: set = set()  # sids with live connections; used by clear_cache to find stale entries
 
@@ -1961,6 +2314,12 @@ def create_socketio_app(model, processor):
             task.cancel()
             _logger.info(f"{reason}: cancelled task for sid={sid} (request_id={req_id})")
 
+    async def _abort_predgen_active(sid: str, reason: str) -> None:
+        task = _predgen_active.pop(sid, None)
+        if task is not None and not task.done():
+            task.cancel()
+            _logger.info("%s: cancelled PredGen task for sid=%s", reason, sid)
+
     @sio.on("connect")
     async def on_connect(sid, environ):
         _logger.info(f"connect    sid={sid}")
@@ -1976,6 +2335,7 @@ def create_socketio_app(model, processor):
         if cache is not None:
             _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
         await _abort_active(sid, "disconnect")
+        await _abort_predgen_active(sid, "disconnect")
 
     @sio.on("generate")
     async def on_generate(sid, payload):
@@ -1990,6 +2350,40 @@ def create_socketio_app(model, processor):
         )
         _active[sid] = (task, request_id)
 
+    @sio.on("pred_gen_style_generation")
+    async def on_pred_gen_style_generation(sid, payload):
+        """Dedicated request/ack endpoint for PredGen Top-K verification."""
+        await _abort_predgen_active(sid, "new pred_gen_style_generation")
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            _predgen_active[sid] = current_task
+        try:
+            return await _predgen_style_generation(
+                model=model,
+                processor=processor,
+                payload=dict(payload or {}),
+                session_cache=_session_caches.get(sid),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            request_id = str((payload or {}).get("request_id") or "")
+            _logger.error(
+                "[%s] PredGen endpoint failed: %s",
+                request_id,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "request_id": request_id,
+                "status": "error",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        finally:
+            if _predgen_active.get(sid) is current_task:
+                _predgen_active.pop(sid, None)
+
     @sio.on("stop")
     async def on_stop(sid, payload=None):
         await _abort_active(sid, "stop")
@@ -2002,10 +2396,15 @@ def create_socketio_app(model, processor):
         requests belonging to stale sessions, releases their MmItemCache
         entries, then emits a bare ``cache_cleared`` ack to the caller.
         """
-        stale_sids = (set(_session_caches.keys()) | set(_active.keys())) - _connected_sids
+        stale_sids = (
+            set(_session_caches.keys())
+            | set(_active.keys())
+            | set(_predgen_active.keys())
+        ) - _connected_sids
         for stale_sid in stale_sids:
             cache = _session_caches.pop(stale_sid, None)
             await _abort_active(stale_sid, "clear_cache")
+            await _abort_predgen_active(stale_sid, "clear_cache")
             _logger.info(
                 f"clear_cache: released sid={stale_sid} "
                 f"(cache entries: {len(cache) if cache is not None else 0})"
