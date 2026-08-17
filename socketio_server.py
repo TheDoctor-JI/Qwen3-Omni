@@ -113,6 +113,11 @@ os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
 
 from argparse import ArgumentParser
+
+from predgen_timing import (
+    PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION,
+    first_response_token_index,
+)
 import socketio
 from aiohttp import web
 from transformers import AutoTokenizer, Qwen3OmniMoeProcessor
@@ -2048,6 +2053,10 @@ async def _predgen_style_generation(
     verification_duration = 0.0
     continuation_duration = 0.0
     first_generated_token_at: Optional[float] = None
+    first_response_token_at: Optional[float] = None
+    first_response_index: Optional[int] = None
+    first_response_source: Optional[str] = None
+    verification_completed_elapsed: Optional[float] = None
     timed_out = False
     rejection_index: Optional[int] = None
     candidate_ranks: List[int] = []
@@ -2075,6 +2084,12 @@ async def _predgen_style_generation(
         ) = await asyncio.to_thread(_prepare_inputs, processor, payload, session_cache)
 
         prompt_text = str(inputs.get("prompt", ""))
+        open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
+        close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
+        starts_in_thinking = bool(
+            params.get("thinking_mode", True)
+            and prompt_text.rstrip().endswith(open_tag)
+        )
         try:
             base_prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         except TypeError:
@@ -2136,6 +2151,23 @@ async def _predgen_style_generation(
                         rejection_index = offset
                         accepted_token_ids = candidate_token_ids[:offset]
                         break
+                verification_completed_elapsed = time.perf_counter() - started_at
+
+                accepted_response_index = first_response_token_index(
+                    tokenizer,
+                    accepted_token_ids,
+                    starts_in_thinking=starts_in_thinking,
+                    open_tag=open_tag,
+                    close_tag=close_tag,
+                )
+                if accepted_response_index is not None:
+                    first_response_index = accepted_response_index
+                    first_response_source = "accepted_prefix"
+                    # A retained response prefix becomes authoritative under
+                    # the new context only when verification has completed.
+                    first_response_token_at = (
+                        started_at + verification_completed_elapsed
+                    )
             elif not timed_out:
                 raise RuntimeError("PredGen verification ended without a finished vLLM output")
 
@@ -2173,6 +2205,19 @@ async def _predgen_style_generation(
                         finish_reason = getattr(output_item, "finish_reason", None)
                         if generated_token_ids and first_generated_token_at is None:
                             first_generated_token_at = time.perf_counter()
+                        if first_response_token_at is None and generated_token_ids:
+                            updated_ids_so_far = accepted_token_ids + generated_token_ids
+                            generated_response_index = first_response_token_index(
+                                tokenizer,
+                                updated_ids_so_far,
+                                starts_in_thinking=starts_in_thinking,
+                                open_tag=open_tag,
+                                close_tag=close_tag,
+                            )
+                            if generated_response_index is not None:
+                                first_response_index = generated_response_index
+                                first_response_source = "generated"
+                                first_response_token_at = time.perf_counter()
                     if _deadline_reached():
                         timed_out = True
                         await model.abort(generation_request_id)
@@ -2199,6 +2244,11 @@ async def _predgen_style_generation(
             if first_generated_token_at is not None
             else None
         )
+        llm_time_to_first_response_token = (
+            first_response_token_at - started_at
+            if first_response_token_at is not None
+            else None
+        )
         generation_duration = (
             max(0.0, total_duration - time_to_first_token)
             if time_to_first_token is not None
@@ -2213,6 +2263,7 @@ async def _predgen_style_generation(
             "candidate_finished": candidate_finished,
             "candidate_model_fingerprint": model_fingerprint,
             "candidate_tokenizer_fingerprint": tokenizer_fingerprint,
+            "candidate_starts_in_thinking": starts_in_thinking,
             "prior_candidate_tokens": len(candidate_token_ids),
             "accepted_prefix_tokens": len(accepted_token_ids),
             "rejected_suffix_tokens": max(
@@ -2238,12 +2289,22 @@ async def _predgen_style_generation(
             "generated_tokens": len(generated_token_ids),
             "verification_top_k": verification_top_k,
             "finish_reason": finish_reason,
+            "response_timing_contract_version": PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION,
+            "response_boundary_reached": first_response_index is not None,
+            "first_response_token_index": first_response_index,
+            "first_response_token_source": first_response_source,
             "confirmed_items": confirmed_items,
             "metrics": {
                 "request_id": request_id,
                 "input_text_tokens": input_text_tokens,
                 "input_audio_duration_sec": input_audio_duration_sec,
                 "time_to_first_token": time_to_first_token,
+                "llm_time_to_first_response_token": llm_time_to_first_response_token,
+                "verification_completed_elapsed": verification_completed_elapsed,
+                "response_timing_contract_version": PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION,
+                "response_boundary_reached": first_response_index is not None,
+                "first_response_token_index": first_response_index,
+                "first_response_token_source": first_response_source,
                 "generation_duration": generation_duration,
                 "total_duration": total_duration,
                 "preprocessing_duration": max(
