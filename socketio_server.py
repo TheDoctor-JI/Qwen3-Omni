@@ -2228,6 +2228,18 @@ async def _predgen_style_generation(
                     raise RuntimeError("PredGen continuation ended without a vLLM output")
 
         updated_candidate_ids = accepted_token_ids + generated_token_ids
+        if first_response_index is None:
+            generated_response_offset = len(generated_token_ids)
+        else:
+            generated_response_offset = max(
+                0,
+                min(
+                    len(generated_token_ids),
+                    int(first_response_index) - len(accepted_token_ids),
+                ),
+            )
+        generated_thinking_token_ids = generated_token_ids[:generated_response_offset]
+        generated_response_token_ids = generated_token_ids[generated_response_offset:]
         if timed_out and candidate_token_ids and not verification_completed:
             candidate_finished = prior_finished
         else:
@@ -2260,6 +2272,28 @@ async def _predgen_style_generation(
             "status": "timed_out" if timed_out else "complete",
             "candidate_token_ids": updated_candidate_ids,
             "candidate_text": _predgen_decode_candidate(processor, updated_candidate_ids),
+            # Decoded transition diagnostics are persisted by the research
+            # client so the viewer can show the exact speculative state change.
+            # Do this here, at the tokenizer-owning boundary, instead of trying
+            # to recover token/character boundaries in JavaScript.
+            "prior_candidate_text": _predgen_decode_candidate(
+                processor, candidate_token_ids
+            ),
+            "accepted_prefix_text": _predgen_decode_candidate(
+                processor, accepted_token_ids
+            ),
+            "rejected_suffix_text": _predgen_decode_candidate(
+                processor, candidate_token_ids[len(accepted_token_ids):]
+            ),
+            "generated_suffix_text": _predgen_decode_candidate(
+                processor, generated_token_ids
+            ),
+            "generated_thinking_text": _predgen_decode_candidate(
+                processor, generated_thinking_token_ids
+            ),
+            "generated_response_text": _predgen_decode_candidate(
+                processor, generated_response_token_ids
+            ),
             "candidate_finished": candidate_finished,
             "candidate_model_fingerprint": model_fingerprint,
             "candidate_tokenizer_fingerprint": tokenizer_fingerprint,
@@ -2287,6 +2321,8 @@ async def _predgen_style_generation(
                 )
             ),
             "generated_tokens": len(generated_token_ids),
+            "generated_thinking_tokens": len(generated_thinking_token_ids),
+            "generated_response_tokens": len(generated_response_token_ids),
             "verification_top_k": verification_top_k,
             "finish_reason": finish_reason,
             "response_timing_contract_version": PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION,
