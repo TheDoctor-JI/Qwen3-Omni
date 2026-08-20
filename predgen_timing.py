@@ -7,10 +7,11 @@ response content; character offsets are never used to splice token state.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 
 PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION = "predgen_response_availability_v1"
+PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION = "response_tokens_v1"
 
 
 def _decode_candidate(tokenizer: Any, token_ids: Sequence[int]) -> str:
@@ -108,3 +109,66 @@ def first_response_token_index(
         else:
             low = middle + 1
     return low - 1
+
+
+def candidate_is_in_thinking(
+    tokenizer: Any,
+    token_ids: Sequence[int],
+    *,
+    starts_in_thinking: bool,
+    open_tag: str = "<think>",
+    close_tag: str = "</think>",
+) -> bool:
+    """Return whether continuation from ``token_ids`` is still in thinking."""
+    text = _decode_candidate(tokenizer, token_ids)
+    if starts_in_thinking:
+        return close_tag not in text
+    open_index = text.find(open_tag)
+    if open_index < 0:
+        return False
+    return text.find(close_tag, open_index + len(open_tag)) < 0
+
+
+def append_missing_thinking_close_token_ids(
+    tokenizer: Any,
+    token_ids: Sequence[int],
+    *,
+    close_tag: str = "</think>",
+) -> Tuple[List[int], List[int], bool]:
+    """Append exactly one close marker without retokenizing candidate content.
+
+    A trailing partial marker is replaced only when it aligns to complete token
+    boundaries.  If it cannot be repaired without changing earlier candidate
+    tokens, fail explicitly instead of corrupting authoritative PredGen state.
+    """
+    ids = [int(token_id) for token_id in token_ids]
+    text = _decode_candidate(tokenizer, ids)
+    if close_tag in text:
+        return ids, [], False
+
+    partial_length = 0
+    for length in range(min(len(close_tag) - 1, len(text)), 0, -1):
+        if text.endswith(close_tag[:length]):
+            partial_length = length
+            break
+    target_prefix = text[:-partial_length] if partial_length else text
+
+    encode_kwargs = {"add_special_tokens": False}
+    try:
+        close_ids = [int(token_id) for token_id in tokenizer.encode(close_tag, **encode_kwargs)]
+    except TypeError:
+        close_ids = [int(token_id) for token_id in tokenizer.encode(close_tag)]
+    if not close_ids:
+        raise RuntimeError("PredGen tokenizer produced no token IDs for the thinking close tag")
+
+    max_trim = min(16, len(ids)) if partial_length else 0
+    for trim_count in range(max_trim + 1):
+        kept = ids[:-trim_count] if trim_count else list(ids)
+        if _decode_candidate(tokenizer, kept) != target_prefix:
+            continue
+        combined = kept + close_ids
+        if _decode_candidate(tokenizer, combined) == target_prefix + close_tag:
+            return combined, close_ids, bool(partial_length)
+    raise RuntimeError(
+        "PredGen could not append the thinking close tag without retokenizing candidate content"
+    )

@@ -115,7 +115,10 @@ DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
 from argparse import ArgumentParser
 
 from predgen_timing import (
+    PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION,
     PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION,
+    append_missing_thinking_close_token_ids,
+    candidate_is_in_thinking,
     first_response_token_index,
 )
 import socketio
@@ -998,6 +1001,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "generated_tokens":    0,
                 "time_to_first_token": None,
                 "llm_time_to_first_response_token": None,
+                "tokens_to_first_response": None,
+                "tokens_before_forced_close": None,
+                "response_token_distance_contract_version": PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION,
                 "thinking_time_to_first_token": 0.0,
                 "thinking_duration": 0.0,
                 "input_text_tokens":   input_text_tokens,
@@ -1169,6 +1175,8 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     n_tokens     = 0
     ttft         = None
     _t_first_response_token = None
+    _tokens_to_first_response = None
+    _tokens_before_forced_close = None
     _think_started = False
     _think_ended   = False
     _t_think_start = None   # elapsed when thinking block started (for max_thinking_dur)
@@ -1539,6 +1547,17 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         partial = full_text.lstrip()
                         if not (partial and open_tag.startswith(partial)):
                             _t_first_response_token = elapsed
+                    if _t_first_response_token is not None and output_item is not None:
+                        _response_index = first_response_token_index(
+                            _get_tokenizer(processor),
+                            list(getattr(output_item, "token_ids", None) or []),
+                            starts_in_thinking=bool(
+                                str(inputs.get("prompt", "")).rstrip().endswith(open_tag)
+                            ),
+                            open_tag=open_tag,
+                            close_tag=close_tag,
+                        )
+                        _tokens_to_first_response = _response_index
 
                 token_payload = {
                     "request_id": request_id,
@@ -1569,6 +1588,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                     "generated_tokens": n_tokens,
                     "time_to_first_token": round(ttft, 3) if ttft is not None else None,
                     "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+                    "tokens_to_first_response": _tokens_to_first_response,
+                    "tokens_before_forced_close": _tokens_before_forced_close,
+                    "response_token_distance_contract_version": PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION,
                     "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
                     "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
                     "input_text_tokens": input_text_tokens,
@@ -1631,6 +1653,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
         # but prev_text (which tracks exactly what was sent to the client)
         # does not contain the complete close tag.
         if thinking_mode and _think_started and close_tag not in prev_text:
+            _tokens_before_forced_close = n_tokens
             synth_delta = close_tag  # full tag by default
             for plen in range(len(close_tag) - 1, 0, -1):
                 if prev_text.endswith(close_tag[:plen]):
@@ -1675,6 +1698,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
         if thinking_mode and not _think_started and not _think_ended:
             for plen in range(len(open_tag) - 1, 0, -1):
                 if prev_text == open_tag[:plen]:
+                    _tokens_before_forced_close = n_tokens
                     synth_delta = open_tag[plen:] + close_tag
                     prev_text = prev_text + synth_delta
                     n_tokens += 1
@@ -1733,6 +1757,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "generated_tokens":    n_tokens,
                 "time_to_first_token": round(ttft, 3) if ttft is not None else None,
                 "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+                "tokens_to_first_response": _tokens_to_first_response,
+                "tokens_before_forced_close": _tokens_before_forced_close,
+                "response_token_distance_contract_version": PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION,
                 "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
                 "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
                 "input_text_tokens":   input_text_tokens,
@@ -1780,6 +1807,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                 "generated_tokens":    n_tokens,
                 "time_to_first_token": round(ttft, 3) if ttft is not None else None,
                 "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+                "tokens_to_first_response": _tokens_to_first_response,
+                "tokens_before_forced_close": _tokens_before_forced_close,
+                "response_token_distance_contract_version": PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION,
                 "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
                 "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
                 "input_text_tokens":   input_text_tokens,
@@ -1852,6 +1882,9 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
             "generated_tokens":    n_tokens,
             "time_to_first_token": round(ttft, 3) if ttft is not None else None,
             "llm_time_to_first_response_token": round(_t_first_response_token, 3) if _t_first_response_token is not None else None,
+            "tokens_to_first_response": _tokens_to_first_response,
+            "tokens_before_forced_close": _tokens_before_forced_close,
+            "response_token_distance_contract_version": PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION,
             "thinking_time_to_first_token": round(ttft, 3) if (_think_started and ttft is not None) else 0.0,
             "thinking_duration": round(max(0.0, _t_think_end - ttft), 3) if (_think_started and _think_ended and _t_think_end is not None and ttft is not None) else 0.0,
             "input_text_tokens":   input_text_tokens,
@@ -2045,6 +2078,12 @@ async def _predgen_style_generation(
     allowed_duration = float(allowed_duration) if allowed_duration is not None else None
     if allowed_duration is not None and allowed_duration <= 0:
         raise ValueError("allowed_gen_duration_s must be positive when provided")
+    max_thinking_duration = params.get("max_thinking_dur")
+    max_thinking_duration = (
+        float(max_thinking_duration) if max_thinking_duration is not None else None
+    )
+    if max_thinking_duration is not None and max_thinking_duration <= 0:
+        raise ValueError("max_thinking_dur must be positive when provided")
 
     started_at = time.perf_counter()
     deadline = started_at + allowed_duration if allowed_duration is not None else None
@@ -2063,7 +2102,24 @@ async def _predgen_style_generation(
     verification_completed = False
     accepted_token_ids = list(candidate_token_ids)
     generated_token_ids: List[int] = []
+    recovery_generated_token_ids: List[int] = []
+    forced_close_token_ids: List[int] = []
     finish_reason: Optional[str] = None
+    pass1_request_id: Optional[str] = None
+    pass2_request_id: Optional[str] = None
+    pass1_duration = 0.0
+    pass2_duration = 0.0
+    pass2_time_to_first_token: Optional[float] = None
+    thinking_phase_duration = 0.0
+    thinking_duration_exceeded = False
+    thinking_token_budget_exhausted = False
+    thinking_stop_reason: Optional[str] = None
+    two_pass = False
+    two_pass_reason: Optional[str] = None
+    response_recovery_deferred = False
+    forced_close_completed_partial = False
+    tokens_to_first_response: Optional[int] = None
+    pass1_model_generated_token_ids: List[int] = []
     confirmed_items: List[dict] = []
     input_text_tokens = 0
     input_audio_duration_sec = 0.0
@@ -2163,6 +2219,8 @@ async def _predgen_style_generation(
                 if accepted_response_index is not None:
                     first_response_index = accepted_response_index
                     first_response_source = "accepted_prefix"
+                    tokens_to_first_response = 0
+                    thinking_stop_reason = "accepted_response"
                     # A retained response prefix becomes authoritative under
                     # the new context only when verification has completed.
                     first_response_token_at = (
@@ -2185,10 +2243,21 @@ async def _predgen_style_generation(
             else:
                 continuation_started_at = time.perf_counter()
                 generation_request_id = f"{request_id}:generate"
+                pass1_request_id = generation_request_id
                 active_engine_request_id = generation_request_id
                 generation_inputs = _predgen_inputs_with_token_ids(
                     inputs,
                     base_prompt_token_ids + accepted_token_ids,
+                )
+                continuation_in_thinking = candidate_is_in_thinking(
+                    tokenizer,
+                    accepted_token_ids,
+                    starts_in_thinking=starts_in_thinking,
+                    open_tag=open_tag,
+                    close_tag=close_tag,
+                )
+                thinking_started_at = (
+                    continuation_started_at if continuation_in_thinking else None
                 )
                 final_output = None
                 async for output in model.generate(
@@ -2205,8 +2274,9 @@ async def _predgen_style_generation(
                         finish_reason = getattr(output_item, "finish_reason", None)
                         if generated_token_ids and first_generated_token_at is None:
                             first_generated_token_at = time.perf_counter()
-                        if first_response_token_at is None and generated_token_ids:
+                        if generated_token_ids:
                             updated_ids_so_far = accepted_token_ids + generated_token_ids
+                            was_in_thinking = continuation_in_thinking
                             generated_response_index = first_response_token_index(
                                 tokenizer,
                                 updated_ids_so_far,
@@ -2214,18 +2284,172 @@ async def _predgen_style_generation(
                                 open_tag=open_tag,
                                 close_tag=close_tag,
                             )
-                            if generated_response_index is not None:
+                            if (
+                                first_response_token_at is None
+                                and generated_response_index is not None
+                            ):
                                 first_response_index = generated_response_index
                                 first_response_source = "generated"
                                 first_response_token_at = time.perf_counter()
-                    if _deadline_reached():
+                                tokens_to_first_response = max(
+                                    0,
+                                    generated_response_index - len(accepted_token_ids),
+                                )
+                                thinking_stop_reason = "natural_response"
+                            continuation_in_thinking = candidate_is_in_thinking(
+                                tokenizer,
+                                updated_ids_so_far,
+                                starts_in_thinking=starts_in_thinking,
+                                open_tag=open_tag,
+                                close_tag=close_tag,
+                            )
+                            if continuation_in_thinking and thinking_started_at is None:
+                                thinking_started_at = time.perf_counter()
+                            elif (
+                                was_in_thinking
+                                and not continuation_in_thinking
+                                and thinking_started_at is not None
+                                and thinking_phase_duration <= 0.0
+                            ):
+                                thinking_phase_duration = max(
+                                    0.0,
+                                    time.perf_counter() - thinking_started_at,
+                                )
+                    now = time.perf_counter()
+                    if deadline is not None and now >= deadline:
                         timed_out = True
+                        thinking_stop_reason = "vad_deadline"
                         await model.abort(generation_request_id)
                         break
-                continuation_duration = time.perf_counter() - continuation_started_at
+                    if (
+                        continuation_in_thinking
+                        and _max_thinking_tokens is not None
+                        and len(generated_token_ids) >= int(_max_thinking_tokens)
+                    ):
+                        thinking_token_budget_exhausted = True
+                        thinking_stop_reason = "token_limit"
+                        await model.abort(generation_request_id)
+                        break
+                    if (
+                        continuation_in_thinking
+                        and max_thinking_duration is not None
+                        and thinking_started_at is not None
+                        and now - thinking_started_at >= max_thinking_duration
+                    ):
+                        thinking_duration_exceeded = True
+                        thinking_stop_reason = "duration_limit"
+                        await model.abort(generation_request_id)
+                        break
+                pass1_duration = time.perf_counter() - continuation_started_at
+                if (
+                    continuation_in_thinking
+                    and thinking_started_at is not None
+                    and thinking_phase_duration <= 0.0
+                ):
+                    thinking_phase_duration = max(
+                        0.0,
+                        time.perf_counter() - thinking_started_at,
+                    )
+                continuation_duration = pass1_duration
                 active_engine_request_id = None
                 if final_output is None and not timed_out:
                     raise RuntimeError("PredGen continuation ended without a vLLM output")
+
+                needs_response_recovery = bool(
+                    (thinking_token_budget_exhausted or thinking_duration_exceeded)
+                    and first_response_index is None
+                    and int(_max_response_tokens or 0) > 0
+                )
+                if needs_response_recovery:
+                    pass1_model_generated_token_ids = list(generated_token_ids)
+                    two_pass_reason = thinking_stop_reason
+                    if _deadline_reached():
+                        response_recovery_deferred = True
+                    else:
+                        recovery_prefix_ids, forced_close_token_ids, forced_close_completed_partial = (
+                            append_missing_thinking_close_token_ids(
+                                tokenizer,
+                                accepted_token_ids + generated_token_ids,
+                                close_tag=close_tag,
+                            )
+                        )
+                        from vllm import SamplingParams
+
+                        response_params = SamplingParams(
+                            temperature=float(params.get("temperature", 0.7)),
+                            top_p=float(params.get("top_p", 0.95)),
+                            top_k=int(params.get("top_k", 20)),
+                            max_tokens=int(_max_response_tokens),
+                            repetition_penalty=float(params.get("repetition_penalty", 1.0)),
+                            presence_penalty=float(params.get("presence_penalty", 0.0)),
+                            frequency_penalty=float(params.get("frequency_penalty", 0.0)),
+                            stop=["<|im_end|>", "<|im_start|>"],
+                        )
+                        pass2_request_id = f"{request_id}:response"
+                        active_engine_request_id = pass2_request_id
+                        pass2_started_at = time.perf_counter()
+                        response_inputs = _predgen_inputs_with_token_ids(
+                            inputs,
+                            base_prompt_token_ids + recovery_prefix_ids,
+                        )
+                        recovery_output = None
+                        async for output in model.generate(
+                            response_inputs,
+                            response_params,
+                            pass2_request_id,
+                        ):
+                            recovery_output = output
+                            output_item = output.outputs[0] if output.outputs else None
+                            if output_item is not None:
+                                recovery_generated_token_ids = [
+                                    int(token_id)
+                                    for token_id in (output_item.token_ids or [])
+                                ]
+                                finish_reason = getattr(output_item, "finish_reason", None)
+                                if recovery_generated_token_ids and pass2_time_to_first_token is None:
+                                    pass2_time_to_first_token = (
+                                        time.perf_counter() - pass2_started_at
+                                    )
+                                if first_response_token_at is None and recovery_generated_token_ids:
+                                    recovery_candidate_ids = (
+                                        recovery_prefix_ids + recovery_generated_token_ids
+                                    )
+                                    recovered_response_index = first_response_token_index(
+                                        tokenizer,
+                                        recovery_candidate_ids,
+                                        starts_in_thinking=starts_in_thinking,
+                                        open_tag=open_tag,
+                                        close_tag=close_tag,
+                                    )
+                                    if recovered_response_index is not None:
+                                        first_response_index = recovered_response_index
+                                        first_response_source = "response_recovery"
+                                        first_response_token_at = time.perf_counter()
+                                        tokens_to_first_response = len(generated_token_ids)
+                            if _deadline_reached():
+                                timed_out = True
+                                thinking_stop_reason = "vad_deadline"
+                                await model.abort(pass2_request_id)
+                                break
+                        pass2_duration = time.perf_counter() - pass2_started_at
+                        continuation_duration += pass2_duration
+                        active_engine_request_id = None
+                        if recovery_output is None and not timed_out:
+                            raise RuntimeError(
+                                "PredGen response recovery ended without a vLLM output"
+                            )
+                        recovery_text = _predgen_decode_candidate(
+                            processor, recovery_generated_token_ids
+                        )
+                        if open_tag in recovery_text:
+                            raise RuntimeError(
+                                "PredGen response-only recovery reopened the thinking block"
+                            )
+                        two_pass = True
+                        generated_token_ids = (
+                            recovery_prefix_ids[len(accepted_token_ids):]
+                            + recovery_generated_token_ids
+                        )
 
         updated_candidate_ids = accepted_token_ids + generated_token_ids
         if first_response_index is None:
@@ -2238,8 +2462,14 @@ async def _predgen_style_generation(
                     int(first_response_index) - len(accepted_token_ids),
                 ),
             )
-        generated_thinking_token_ids = generated_token_ids[:generated_response_offset]
-        generated_response_token_ids = generated_token_ids[generated_response_offset:]
+        if two_pass:
+            generated_thinking_token_ids = list(pass1_model_generated_token_ids)
+            generated_response_token_ids = list(recovery_generated_token_ids)
+        else:
+            generated_thinking_token_ids = generated_token_ids[:generated_response_offset]
+            generated_response_token_ids = generated_token_ids[generated_response_offset:]
+        if first_response_index is None and not timed_out:
+            thinking_stop_reason = thinking_stop_reason or "no_response"
         if timed_out and candidate_token_ids and not verification_completed:
             candidate_finished = prior_finished
         else:
@@ -2294,6 +2524,9 @@ async def _predgen_style_generation(
             "generated_response_text": _predgen_decode_candidate(
                 processor, generated_response_token_ids
             ),
+            "forced_think_end_text": _predgen_decode_candidate(
+                processor, forced_close_token_ids
+            ),
             "candidate_finished": candidate_finished,
             "candidate_model_fingerprint": model_fingerprint,
             "candidate_tokenizer_fingerprint": tokenizer_fingerprint,
@@ -2323,12 +2556,31 @@ async def _predgen_style_generation(
             "generated_tokens": len(generated_token_ids),
             "generated_thinking_tokens": len(generated_thinking_token_ids),
             "generated_response_tokens": len(generated_response_token_ids),
+            "forced_think_end_tokens": len(forced_close_token_ids),
             "verification_top_k": verification_top_k,
             "finish_reason": finish_reason,
             "response_timing_contract_version": PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION,
             "response_boundary_reached": first_response_index is not None,
             "first_response_token_index": first_response_index,
             "first_response_token_source": first_response_source,
+            "tokens_to_first_response": tokens_to_first_response,
+            "candidate_tokens_before_first_response": first_response_index,
+            "response_token_distance_contract_version": (
+                PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION
+            ),
+            "thinking_dur_exceeded": thinking_duration_exceeded,
+            "thinking_budget_burned_out": thinking_token_budget_exhausted,
+            "thinking_stop_reason": thinking_stop_reason,
+            "two_pass": two_pass,
+            "two_pass_reason": (
+                two_pass_reason if two_pass else None
+            ),
+            "pass1_request_id": pass1_request_id,
+            "pass2_request_id": pass2_request_id,
+            "pass1_elapsed": pass1_duration,
+            "pass2_time_to_first_token": pass2_time_to_first_token,
+            "forced_think_end_completed_partial": forced_close_completed_partial,
+            "response_recovery_deferred_by_vad_deadline": response_recovery_deferred,
             "confirmed_items": confirmed_items,
             "metrics": {
                 "request_id": request_id,
@@ -2341,6 +2593,11 @@ async def _predgen_style_generation(
                 "response_boundary_reached": first_response_index is not None,
                 "first_response_token_index": first_response_index,
                 "first_response_token_source": first_response_source,
+                "tokens_to_first_response": tokens_to_first_response,
+                "candidate_tokens_before_first_response": first_response_index,
+                "response_token_distance_contract_version": (
+                    PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION
+                ),
                 "generation_duration": generation_duration,
                 "total_duration": total_duration,
                 "preprocessing_duration": max(
@@ -2349,8 +2606,25 @@ async def _predgen_style_generation(
                 ),
                 "verification_duration": verification_duration,
                 "continuation_duration": continuation_duration,
+                "pass1_elapsed": pass1_duration,
+                "thinking_duration": thinking_phase_duration,
+                "pass2_duration": pass2_duration,
+                "pass2_time_to_first_token": pass2_time_to_first_token,
                 "generated_tokens": len(generated_token_ids),
+                "generated_thinking_tokens": len(generated_thinking_token_ids),
+                "generated_response_tokens": len(generated_response_token_ids),
+                "forced_think_end_tokens": len(forced_close_token_ids),
                 "candidate_tokens": len(updated_candidate_ids),
+                "max_thinking_dur": max_thinking_duration,
+                "thinking_dur_exceeded": thinking_duration_exceeded,
+                "thinking_budget_burned_out": thinking_token_budget_exhausted,
+                "thinking_stop_reason": thinking_stop_reason,
+                "two_pass": two_pass,
+                "two_pass_reason": two_pass_reason if two_pass else None,
+                "pass1_request_id": pass1_request_id,
+                "pass2_request_id": pass2_request_id,
+                "forced_think_end_completed_partial": forced_close_completed_partial,
+                "response_recovery_deferred_by_vad_deadline": response_recovery_deferred,
                 "allowed_gen_duration_s": allowed_duration,
                 "generation_timed_out": timed_out,
             },
@@ -2484,6 +2758,7 @@ def create_socketio_app(model, processor):
     @sio.on("stop")
     async def on_stop(sid, payload=None):
         await _abort_active(sid, "stop")
+        await _abort_predgen_active(sid, "stop")
 
     @sio.on("clear_cache")
     async def on_clear_cache(sid, data=None):
