@@ -82,6 +82,7 @@ PredGen protocol (isolated from ``generate``):
 import asyncio
 import base64
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -2013,6 +2014,23 @@ def _predgen_decode_candidate(processor: Any, token_ids: List[int]) -> str:
     )
 
 
+def _token_prefix_before_char(
+    processor: Any,
+    token_ids: List[int],
+    char_index: int,
+) -> List[int]:
+    """Return the longest token prefix decoded wholly before ``char_index``."""
+    if char_index <= 0:
+        return []
+    accepted: List[int] = []
+    for offset in range(1, len(token_ids) + 1):
+        decoded = _predgen_decode_candidate(processor, token_ids[:offset])
+        if len(decoded) > char_index:
+            break
+        accepted = token_ids[:offset]
+    return accepted
+
+
 def _predgen_fingerprints(model: Any, processor: Any) -> Tuple[str, str]:
     tokenizer = _get_tokenizer(processor)
     tokenizer_fingerprint = str(
@@ -2051,6 +2069,8 @@ async def _predgen_style_generation(
     if verification_top_k < 1:
         raise ValueError("verification_top_k must be at least 1")
 
+    candidate_thinking_text_supplied = "candidate_thinking_text" in payload
+    candidate_thinking_text = str(payload.get("candidate_thinking_text") or "")
     raw_candidate = payload.get("candidate_token_ids") or []
     if not isinstance(raw_candidate, list):
         raise ValueError("candidate_token_ids must be a list")
@@ -2061,6 +2081,21 @@ async def _predgen_style_generation(
     tokenizer = _get_tokenizer(processor)
     if tokenizer is None:
         raise RuntimeError("PredGen requires a tokenizer")
+    if candidate_thinking_text_supplied:
+        if not candidate_thinking_text.strip():
+            raise ValueError("candidate_thinking_text must be non-empty")
+        try:
+            candidate_token_ids = tokenizer.encode(
+                candidate_thinking_text,
+                add_special_tokens=False,
+            )
+        except TypeError:
+            candidate_token_ids = tokenizer.encode(candidate_thinking_text)
+        candidate_token_ids = [int(token_id) for token_id in candidate_token_ids]
+        if not candidate_token_ids:
+            raise ValueError("candidate_thinking_text encoded to zero tokens")
+        if len(candidate_token_ids) > 65536:
+            raise ValueError("candidate_thinking_text exceeds the 65536-token safety limit")
     tokenizer_size = len(tokenizer)
     if any(token_id < 0 or token_id >= tokenizer_size for token_id in candidate_token_ids):
         raise ValueError("candidate_token_ids contains an out-of-vocabulary token ID")
@@ -2068,12 +2103,24 @@ async def _predgen_style_generation(
     model_fingerprint, tokenizer_fingerprint = _predgen_fingerprints(model, processor)
     supplied_model_fingerprint = str(payload.get("candidate_model_fingerprint") or "")
     supplied_tokenizer_fingerprint = str(payload.get("candidate_tokenizer_fingerprint") or "")
-    if candidate_token_ids and supplied_model_fingerprint != model_fingerprint:
+    if (
+        candidate_token_ids
+        and not candidate_thinking_text_supplied
+        and supplied_model_fingerprint != model_fingerprint
+    ):
         raise ValueError("PredGen candidate model fingerprint does not match this server")
-    if candidate_token_ids and supplied_tokenizer_fingerprint != tokenizer_fingerprint:
+    if (
+        candidate_token_ids
+        and not candidate_thinking_text_supplied
+        and supplied_tokenizer_fingerprint != tokenizer_fingerprint
+    ):
         raise ValueError("PredGen candidate tokenizer fingerprint does not match this server")
 
     prior_finished = bool(payload.get("candidate_finished", False))
+    allow_summary_recovery = bool(payload.get("allow_summary_recovery", False))
+    summary_threshold = float(payload.get("pred_gen_trigger_summ_threshold", 0.5))
+    if not math.isfinite(summary_threshold) or not 0.0 <= summary_threshold <= 1.0:
+        raise ValueError("pred_gen_trigger_summ_threshold must be in [0, 1]")
     allowed_duration = params.get("allowed_gen_duration_s")
     allowed_duration = float(allowed_duration) if allowed_duration is not None else None
     if allowed_duration is not None and allowed_duration <= 0:
@@ -2100,6 +2147,7 @@ async def _predgen_style_generation(
     rejection_index: Optional[int] = None
     candidate_ranks: List[int] = []
     verification_completed = False
+    summary_required = False
     accepted_token_ids = list(candidate_token_ids)
     generated_token_ids: List[int] = []
     recovery_generated_token_ids: List[int] = []
@@ -2113,6 +2161,13 @@ async def _predgen_style_generation(
     thinking_phase_duration = 0.0
     thinking_duration_exceeded = False
     thinking_token_budget_exhausted = False
+    thinking_abort_word_detected = False
+    thinking_abort_word_match: Optional[str] = None
+    thinking_looping_detected = False
+    thinking_looping_compression_ratio: Optional[float] = None
+    thinking_looping_ngram_uniqueness: Optional[float] = None
+    thinking_similarity_abort_detected = False
+    thinking_similarity_abort_compression_ratio: Optional[float] = None
     thinking_stop_reason: Optional[str] = None
     two_pass = False
     two_pass_reason: Optional[str] = None
@@ -2123,6 +2178,38 @@ async def _predgen_style_generation(
     confirmed_items: List[dict] = []
     input_text_tokens = 0
     input_audio_duration_sec = 0.0
+
+    abort_word_list = [
+        str(word) for word in (params.get("thinking_abort_word_list") or [])
+        if isinstance(word, str) and word
+    ]
+    enable_looping_detection = bool(params.get("enable_looping_detection", False))
+    abort_at_looping = bool(params.get("abort_at_looping", False))
+    looping_compression_threshold = float(
+        params.get("looping_compression_ratio_threshold", 0.35)
+    )
+    looping_ngram_threshold = float(
+        params.get("looping_ngram_uniqueness_threshold", 0.30)
+    )
+    raw_loop_windows = params.get("looping_trailing_window_chars", 1024)
+    loop_windows = (
+        [int(value) for value in raw_loop_windows]
+        if isinstance(raw_loop_windows, list)
+        else [int(raw_loop_windows)]
+    )
+    similarity_enabled = bool(
+        params.get("abort_at_similarity_with_prior_derivations", False)
+    )
+    similarity_reference = str(params.get("similarity_abort_reference_text") or "")
+    similarity_trailing_chars = int(params.get("similarity_abort_trailing_chars", 1024))
+    similarity_threshold = float(
+        params.get("similarity_abort_compression_ratio_threshold", 0.50)
+    )
+    reference_compressed_len = (
+        len(zlib.compress(similarity_reference.encode("utf-8"), level=1))
+        if similarity_enabled and similarity_reference.strip()
+        else 0
+    )
 
     def _deadline_reached() -> bool:
         return deadline is not None and time.perf_counter() >= deadline
@@ -2230,6 +2317,20 @@ async def _predgen_style_generation(
                 raise RuntimeError("PredGen verification ended without a finished vLLM output")
 
         fully_accepted = rejection_index is None
+        accepted_ratio = (
+            (
+                len(accepted_token_ids) / len(candidate_token_ids)
+                if candidate_token_ids else 1.0
+            )
+            if verification_completed or not candidate_token_ids
+            else None
+        )
+        summary_required = bool(
+            allow_summary_recovery
+            and verification_completed
+            and accepted_ratio is not None
+            and accepted_ratio <= summary_threshold
+        )
         candidate_still_finished = bool(
             candidate_token_ids
             and prior_finished
@@ -2237,7 +2338,7 @@ async def _predgen_style_generation(
             and fully_accepted
         )
 
-        if not timed_out and not candidate_still_finished:
+        if not timed_out and not candidate_still_finished and not summary_required:
             if _deadline_reached():
                 timed_out = True
             else:
@@ -2303,6 +2404,68 @@ async def _predgen_style_generation(
                                 open_tag=open_tag,
                                 close_tag=close_tag,
                             )
+                            if was_in_thinking:
+                                generated_text = _predgen_decode_candidate(
+                                    processor, generated_token_ids
+                                )
+                                generated_thinking_text = generated_text.split(
+                                    close_tag, 1
+                                )[0]
+                                abort_match = next(
+                                    (
+                                        word for word in abort_word_list
+                                        if word in generated_thinking_text
+                                    ),
+                                    None,
+                                )
+                                if abort_match is not None:
+                                    thinking_abort_word_detected = True
+                                    thinking_abort_word_match = abort_match
+                                    match_index = generated_thinking_text.find(abort_match)
+                                    generated_token_ids = _token_prefix_before_char(
+                                        processor,
+                                        generated_token_ids,
+                                        match_index,
+                                    )
+                                    thinking_stop_reason = "abort_word"
+                                    await model.abort(generation_request_id)
+                                    break
+                                if enable_looping_detection and generated_thinking_text:
+                                    for window in loop_windows:
+                                        trailing = generated_thinking_text[-max(1, window):]
+                                        compression_score = _compression_looping_score(trailing)
+                                        uniqueness_score = _ngram_uniqueness(trailing)
+                                        if (
+                                            compression_score < looping_compression_threshold
+                                            or uniqueness_score < looping_ngram_threshold
+                                        ):
+                                            thinking_looping_detected = True
+                                            thinking_looping_compression_ratio = compression_score
+                                            thinking_looping_ngram_uniqueness = uniqueness_score
+                                            if abort_at_looping:
+                                                thinking_stop_reason = "looping"
+                                                await model.abort(generation_request_id)
+                                            break
+                                    if thinking_looping_detected and abort_at_looping:
+                                        break
+                                if reference_compressed_len and generated_thinking_text:
+                                    trailing = generated_thinking_text[-similarity_trailing_chars:]
+                                    combined_len = len(zlib.compress(
+                                        (similarity_reference + trailing).encode("utf-8"),
+                                        level=1,
+                                    ))
+                                    trailing_raw_len = max(1, len(trailing.encode("utf-8")))
+                                    redundancy_ratio = max(
+                                        0.0,
+                                        (combined_len - reference_compressed_len)
+                                        / trailing_raw_len,
+                                    )
+                                    if redundancy_ratio < similarity_threshold:
+                                        thinking_similarity_abort_detected = True
+                                        thinking_similarity_abort_compression_ratio = redundancy_ratio
+                                        thinking_stop_reason = "similarity_abort"
+                                        await model.abort(generation_request_id)
+                                        break
                             if continuation_in_thinking and thinking_started_at is None:
                                 thinking_started_at = time.perf_counter()
                             elif (
@@ -2356,9 +2519,16 @@ async def _predgen_style_generation(
                     raise RuntimeError("PredGen continuation ended without a vLLM output")
 
                 needs_response_recovery = bool(
-                    (thinking_token_budget_exhausted or thinking_duration_exceeded)
+                    (
+                        thinking_token_budget_exhausted
+                        or thinking_duration_exceeded
+                        or thinking_abort_word_detected
+                        or (thinking_looping_detected and abort_at_looping)
+                        or thinking_similarity_abort_detected
+                    )
                     and first_response_index is None
                     and int(_max_response_tokens or 0) > 0
+                    and bool(payload.get("enable_two_pass_on_burnout", True))
                 )
                 if needs_response_recovery:
                     pass1_model_generated_token_ids = list(generated_token_ids)
@@ -2499,7 +2669,11 @@ async def _predgen_style_generation(
 
         return {
             "request_id": request_id,
-            "status": "timed_out" if timed_out else "complete",
+            "status": (
+                "timed_out"
+                if timed_out
+                else ("summary_required" if summary_required else "complete")
+            ),
             "candidate_token_ids": updated_candidate_ids,
             "candidate_text": _predgen_decode_candidate(processor, updated_candidate_ids),
             # Decoded transition diagnostics are persisted by the research
@@ -2524,6 +2698,9 @@ async def _predgen_style_generation(
             "generated_response_text": _predgen_decode_candidate(
                 processor, generated_response_token_ids
             ),
+            "combined_updated_reasoning_text": _predgen_decode_candidate(
+                processor, accepted_token_ids + generated_thinking_token_ids
+            ),
             "forced_think_end_text": _predgen_decode_candidate(
                 processor, forced_close_token_ids
             ),
@@ -2540,6 +2717,15 @@ async def _predgen_style_generation(
             "rejected_at_token_index": rejection_index,
             "candidate_ranks": candidate_ranks,
             "verification_completed": verification_completed or not candidate_token_ids,
+            "verification_timed_out": bool(
+                timed_out and candidate_token_ids and not verification_completed
+            ),
+            "verification_completed_elapsed": verification_completed_elapsed,
+            "continuation_started_elapsed": (
+                verification_completed_elapsed
+                if verification_completed and not summary_required
+                else None
+            ),
             "entire_candidate_accepted": (
                 not candidate_token_ids
                 or (verification_completed and rejection_index is None)
@@ -2553,6 +2739,11 @@ async def _predgen_style_generation(
                     else 1.0
                 )
             ),
+            "accepted_ratio": accepted_ratio,
+            "summary_threshold": summary_threshold,
+            "summary_required": summary_required,
+            "allow_summary_recovery": allow_summary_recovery,
+            "candidate_thinking_text_supplied": candidate_thinking_text_supplied,
             "generated_tokens": len(generated_token_ids),
             "generated_thinking_tokens": len(generated_thinking_token_ids),
             "generated_response_tokens": len(generated_response_token_ids),
@@ -2570,6 +2761,13 @@ async def _predgen_style_generation(
             ),
             "thinking_dur_exceeded": thinking_duration_exceeded,
             "thinking_budget_burned_out": thinking_token_budget_exhausted,
+            "thinking_abort_word_detected": thinking_abort_word_detected,
+            "thinking_abort_word_match": thinking_abort_word_match,
+            "thinking_looping_detected": thinking_looping_detected,
+            "thinking_looping_compression_ratio": thinking_looping_compression_ratio,
+            "thinking_looping_ngram_uniqueness": thinking_looping_ngram_uniqueness,
+            "thinking_similarity_abort_detected": thinking_similarity_abort_detected,
+            "thinking_similarity_abort_compression_ratio": thinking_similarity_abort_compression_ratio,
             "thinking_stop_reason": thinking_stop_reason,
             "two_pass": two_pass,
             "two_pass_reason": (
@@ -2606,6 +2804,9 @@ async def _predgen_style_generation(
                 ),
                 "verification_duration": verification_duration,
                 "continuation_duration": continuation_duration,
+                "accepted_ratio": accepted_ratio,
+                "summary_threshold": summary_threshold,
+                "summary_required": summary_required,
                 "pass1_elapsed": pass1_duration,
                 "thinking_duration": thinking_phase_duration,
                 "pass2_duration": pass2_duration,
@@ -2618,6 +2819,13 @@ async def _predgen_style_generation(
                 "max_thinking_dur": max_thinking_duration,
                 "thinking_dur_exceeded": thinking_duration_exceeded,
                 "thinking_budget_burned_out": thinking_token_budget_exhausted,
+                "thinking_abort_word_detected": thinking_abort_word_detected,
+                "thinking_abort_word_match": thinking_abort_word_match,
+                "thinking_looping_detected": thinking_looping_detected,
+                "thinking_looping_compression_ratio": thinking_looping_compression_ratio,
+                "thinking_looping_ngram_uniqueness": thinking_looping_ngram_uniqueness,
+                "thinking_similarity_abort_detected": thinking_similarity_abort_detected,
+                "thinking_similarity_abort_compression_ratio": thinking_similarity_abort_compression_ratio,
                 "thinking_stop_reason": thinking_stop_reason,
                 "two_pass": two_pass,
                 "two_pass_reason": two_pass_reason if two_pass else None,
@@ -2662,6 +2870,7 @@ def create_socketio_app(model, processor):
 
     _active = {}   # sid -> (asyncio.Task, request_id: str)
     _predgen_active: Dict[str, asyncio.Task] = {}  # isolated from ordinary generation
+    _hybrid_active: Dict[str, asyncio.Task] = {}  # staged candidate verification
     _session_caches: Dict[str, MmItemCache] = {}  # sid -> per-session encoding cache
     _connected_sids: set = set()  # sids with live connections; used by clear_cache to find stale entries
 
@@ -2691,6 +2900,19 @@ def create_socketio_app(model, processor):
             task.cancel()
             _logger.info("%s: cancelled PredGen task for sid=%s", reason, sid)
 
+    async def _abort_hybrid_active(sid: str, reason: str) -> None:
+        task = _hybrid_active.pop(sid, None)
+        if task is not None and not task.done():
+            task.cancel()
+            _logger.info("%s: cancelled hybrid task for sid=%s", reason, sid)
+            try:
+                # _predgen_style_generation aborts its currently owned vLLM
+                # request in CancelledError.  Wait for that cleanup before a
+                # replacement request is allowed to claim the same session.
+                await task
+            except asyncio.CancelledError:
+                pass
+
     @sio.on("connect")
     async def on_connect(sid, environ):
         _logger.info(f"connect    sid={sid}")
@@ -2707,11 +2929,13 @@ def create_socketio_app(model, processor):
             _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
         await _abort_active(sid, "disconnect")
         await _abort_predgen_active(sid, "disconnect")
+        await _abort_hybrid_active(sid, "disconnect")
 
     @sio.on("generate")
     async def on_generate(sid, payload):
         # Cancel any in-flight generation before starting a new one
         await _abort_active(sid, "new generate")
+        await _abort_hybrid_active(sid, "new generate")
         request_id = payload.get('request_id') or str(uuid.uuid4())
         # Inject the resolved request_id back so _stream_generate uses it
         payload['request_id'] = request_id
@@ -2755,10 +2979,45 @@ def create_socketio_app(model, processor):
             if _predgen_active.get(sid) is current_task:
                 _predgen_active.pop(sid, None)
 
+    @sio.on("hybrid_endpoint")
+    async def on_hybrid_endpoint(sid, payload):
+        """Verify staged prior reasoning and optionally continue generation."""
+        await _abort_active(sid, "new hybrid_endpoint")
+        await _abort_predgen_active(sid, "new hybrid_endpoint")
+        await _abort_hybrid_active(sid, "new hybrid_endpoint")
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            _hybrid_active[sid] = current_task
+        try:
+            normalized = dict(payload or {})
+            if "candidate_thinking_text" not in normalized:
+                raise ValueError("hybrid_endpoint requires candidate_thinking_text")
+            return await _predgen_style_generation(
+                model=model,
+                processor=processor,
+                payload=normalized,
+                session_cache=_session_caches.get(sid),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            request_id = str((payload or {}).get("request_id") or "")
+            _logger.error("[%s] Hybrid endpoint failed: %s", request_id, exc, exc_info=True)
+            return {
+                "request_id": request_id,
+                "status": "error",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        finally:
+            if _hybrid_active.get(sid) is current_task:
+                _hybrid_active.pop(sid, None)
+
     @sio.on("stop")
     async def on_stop(sid, payload=None):
         await _abort_active(sid, "stop")
         await _abort_predgen_active(sid, "stop")
+        await _abort_hybrid_active(sid, "stop")
 
     @sio.on("clear_cache")
     async def on_clear_cache(sid, data=None):
@@ -2772,11 +3031,13 @@ def create_socketio_app(model, processor):
             set(_session_caches.keys())
             | set(_active.keys())
             | set(_predgen_active.keys())
+            | set(_hybrid_active.keys())
         ) - _connected_sids
         for stale_sid in stale_sids:
             cache = _session_caches.pop(stale_sid, None)
             await _abort_active(stale_sid, "clear_cache")
             await _abort_predgen_active(stale_sid, "clear_cache")
+            await _abort_hybrid_active(stale_sid, "clear_cache")
             _logger.info(
                 f"clear_cache: released sid={stale_sid} "
                 f"(cache entries: {len(cache) if cache is not None else 0})"
