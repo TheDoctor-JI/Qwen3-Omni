@@ -14,6 +14,49 @@ PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION = "predgen_response_availability_v1"
 PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION = "response_tokens_v1"
 
 
+def _encode_without_special_tokens(tokenizer: Any, text: str) -> List[int]:
+    try:
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        encoded = tokenizer.encode(text)
+    return [int(token_id) for token_id in encoded]
+
+
+def split_rendered_thinking_prefix_token_ids(
+    tokenizer: Any,
+    rendered_prompt: str,
+    thinking_prefix: str,
+) -> Tuple[List[int], List[int]]:
+    """Split a rendered open-thinking prefill into base and candidate IDs.
+
+    The model adapter/chat template owns the exact syntax that opens thinking.
+    The portable contract is only that the rendered prompt ends with the raw
+    thinking-prefix text. Token-boundary alignment is checked explicitly so
+    verification cannot silently rank the wrong prompt suffix.
+    """
+    prompt = str(rendered_prompt or "")
+    prefix = str(thinking_prefix or "")
+    if not prefix:
+        raise ValueError("thinking_prefix must be non-empty")
+    if not prompt.endswith(prefix):
+        raise RuntimeError(
+            "Rendered hybrid prompt does not end with candidate_thinking_text"
+        )
+
+    base_text = prompt[:-len(prefix)]
+    full_token_ids = _encode_without_special_tokens(tokenizer, prompt)
+    base_token_ids = _encode_without_special_tokens(tokenizer, base_text)
+    if full_token_ids[:len(base_token_ids)] != base_token_ids:
+        raise RuntimeError(
+            "Hybrid thinking-prefix tokenization crossed the prompt/prefix boundary"
+        )
+
+    candidate_token_ids = full_token_ids[len(base_token_ids):]
+    if not candidate_token_ids:
+        raise RuntimeError("Rendered hybrid thinking prefix encoded to zero tokens")
+    return base_token_ids, candidate_token_ids
+
+
 def _decode_candidate(tokenizer: Any, token_ids: Sequence[int]) -> str:
     return str(
         tokenizer.decode(

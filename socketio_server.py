@@ -121,6 +121,7 @@ from predgen_timing import (
     append_missing_thinking_close_token_ids,
     candidate_is_in_thinking,
     first_response_token_index,
+    split_rendered_thinking_prefix_token_ids,
 )
 import socketio
 from aiohttp import web
@@ -2081,16 +2082,29 @@ async def _predgen_style_generation(
     tokenizer = _get_tokenizer(processor)
     if tokenizer is None:
         raise RuntimeError("PredGen requires a tokenizer")
+    open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
+    close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
+    hybrid_thinking_prefix = candidate_thinking_text
     if candidate_thinking_text_supplied:
         if not candidate_thinking_text.strip():
             raise ValueError("candidate_thinking_text must be non-empty")
+        if not bool(params.get("thinking_mode", True)):
+            raise ValueError(
+                "hybrid_endpoint requires thinking_mode=True for candidate_thinking_text"
+            )
+        # Match the established thinking-prefix contract: callers send raw
+        # semantic reasoning, while the server owns the model-specific opening
+        # marker. Preserve compatibility with a leaked leading marker in the
+        # same way as _prepare_inputs().
+        if hybrid_thinking_prefix.startswith(open_tag):
+            hybrid_thinking_prefix = hybrid_thinking_prefix[len(open_tag):]
         try:
             candidate_token_ids = tokenizer.encode(
-                candidate_thinking_text,
+                hybrid_thinking_prefix,
                 add_special_tokens=False,
             )
         except TypeError:
-            candidate_token_ids = tokenizer.encode(candidate_thinking_text)
+            candidate_token_ids = tokenizer.encode(hybrid_thinking_prefix)
         candidate_token_ids = [int(token_id) for token_id in candidate_token_ids]
         if not candidate_token_ids:
             raise ValueError("candidate_thinking_text encoded to zero tokens")
@@ -2215,6 +2229,16 @@ async def _predgen_style_generation(
         return deadline is not None and time.perf_counter() >= deadline
 
     try:
+        prepared_payload = payload
+        if candidate_thinking_text_supplied:
+            # Hybrid verification receives semantic reasoning separately from
+            # the normal generation params. Route it through the established
+            # model-owned thinking-prefix renderer before token verification.
+            # The public client contract remains untagged/model-agnostic.
+            prepared_payload = dict(payload)
+            prepared_params = dict(params)
+            prepared_params["thinking_prefix"] = hybrid_thinking_prefix
+            prepared_payload["params"] = prepared_params
         (
             inputs,
             sampling_params,
@@ -2224,20 +2248,54 @@ async def _predgen_style_generation(
             input_audio_duration_sec,
             _max_response_tokens,
             _max_thinking_tokens,
-        ) = await asyncio.to_thread(_prepare_inputs, processor, payload, session_cache)
+        ) = await asyncio.to_thread(
+            _prepare_inputs,
+            processor,
+            prepared_payload,
+            session_cache,
+        )
 
         prompt_text = str(inputs.get("prompt", ""))
-        open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
-        close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
-        starts_in_thinking = bool(
-            params.get("thinking_mode", True)
-            and prompt_text.rstrip().endswith(open_tag)
-        )
-        try:
-            base_prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-        except TypeError:
-            base_prompt_token_ids = tokenizer.encode(prompt_text)
-        base_prompt_token_ids = [int(token_id) for token_id in base_prompt_token_ids]
+        if candidate_thinking_text_supplied:
+            # _prepare_inputs rendered the prompt as an open thinking block
+            # ending in the candidate. Split that exact tokenization so the
+            # verification pass sees the full prefix once, while continuation
+            # can replace its rejected suffix with the accepted prefix.
+            base_prompt_token_ids, candidate_token_ids = (
+                split_rendered_thinking_prefix_token_ids(
+                    tokenizer,
+                    prompt_text,
+                    hybrid_thinking_prefix,
+                )
+            )
+            if len(candidate_token_ids) > 65536:
+                raise ValueError(
+                    "Rendered candidate_thinking_text exceeds the 65536-token safety limit"
+                )
+            if any(
+                token_id < 0 or token_id >= tokenizer_size
+                for token_id in candidate_token_ids
+            ):
+                raise ValueError(
+                    "Rendered candidate_thinking_text contains an out-of-vocabulary token ID"
+                )
+            # The rendered suffix is authoritative because it is the exact
+            # token sequence vLLM will verify and continue from.
+            accepted_token_ids = list(candidate_token_ids)
+            starts_in_thinking = True
+        else:
+            starts_in_thinking = bool(
+                params.get("thinking_mode", True)
+                and prompt_text.rstrip().endswith(open_tag)
+            )
+            try:
+                base_prompt_token_ids = tokenizer.encode(
+                    prompt_text,
+                    add_special_tokens=False,
+                )
+            except TypeError:
+                base_prompt_token_ids = tokenizer.encode(prompt_text)
+            base_prompt_token_ids = [int(token_id) for token_id in base_prompt_token_ids]
 
         if _deadline_reached():
             timed_out = True

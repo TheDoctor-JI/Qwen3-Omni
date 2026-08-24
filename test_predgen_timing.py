@@ -13,6 +13,7 @@ from predgen_timing import (
     candidate_is_in_thinking,
     first_response_token_index,
     response_content_is_available,
+    split_rendered_thinking_prefix_token_ids,
 )
 
 
@@ -28,6 +29,14 @@ class _PieceTokenizer:
         if not matches:
             raise ValueError(f"piece not found: {text!r}")
         return [matches[0]]
+
+
+class _CharacterTokenizer:
+    def encode(self, text, **_kwargs):
+        return [ord(char) for char in text]
+
+    def decode(self, token_ids, **_kwargs):
+        return "".join(chr(int(token_id)) for token_id in token_ids)
 
 
 class PredGenTimingTests(unittest.TestCase):
@@ -100,6 +109,27 @@ class PredGenTimingTests(unittest.TestCase):
         self.assertEqual(closed, [1, 2])
         self.assertEqual(appended, [2])
         self.assertTrue(completed_partial)
+
+    def test_hybrid_prefix_split_keeps_open_marker_in_base_prompt(self) -> None:
+        tokenizer = _CharacterTokenizer()
+        base_ids, candidate_ids = split_rendered_thinking_prefix_token_ids(
+            tokenizer,
+            "chat-template<model-open-think>prior reasoning",
+            "prior reasoning",
+        )
+        self.assertEqual(
+            tokenizer.decode(base_ids),
+            "chat-template<model-open-think>",
+        )
+        self.assertEqual(tokenizer.decode(candidate_ids), "prior reasoning")
+
+    def test_hybrid_prefix_split_rejects_unrendered_candidate(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "does not end"):
+            split_rendered_thinking_prefix_token_ids(
+                _CharacterTokenizer(),
+                "chat-template-without-prefix",
+                "prior reasoning",
+            )
 
 
 if __name__ == "__main__":
