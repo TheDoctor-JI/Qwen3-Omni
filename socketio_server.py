@@ -121,6 +121,7 @@ from predgen_timing import (
     append_missing_thinking_close_token_ids,
     candidate_is_in_thinking,
     first_response_token_index,
+    generation_starts_in_thinking,
     split_rendered_thinking_prefix_token_ids,
 )
 import socketio
@@ -1223,10 +1224,20 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
     # with thinking enabled on a thinking-capable model, generation starts
     # inside an already-open <think> block.
     _thinking_prefix = str(p.get('thinking_prefix', '') or '')
-    if _thinking_prefix and thinking_mode and not _MODEL_IS_INSTRUCT:
+    _generation_starts_in_thinking = generation_starts_in_thinking(
+        str(inputs.get("prompt", "")),
+        thinking_prefix=_thinking_prefix,
+        thinking_mode=thinking_mode,
+        model_is_instruct=_MODEL_IS_INSTRUCT,
+        open_tag=open_tag,
+    )
+    if _generation_starts_in_thinking:
         _think_started = True
         _t_think_start = 0.0  # generation begins inside an open <think> block
-        _logger.info(f"[{request_id}] Delta-thinking mode: _think_started pre-set to True")
+        _logger.info(
+            f"[{request_id}] Generation starts inside an open thinking block"
+            f" (delta_prefix={bool(_thinking_prefix)})"
+        )
 
     try:
         async for output in model.generate(inputs, sampling_params, request_id):
@@ -1553,9 +1564,7 @@ async def _stream_generate_inner(sio, sid, model, processor, payload,
                         _response_index = first_response_token_index(
                             _get_tokenizer(processor),
                             list(getattr(output_item, "token_ids", None) or []),
-                            starts_in_thinking=bool(
-                                str(inputs.get("prompt", "")).rstrip().endswith(open_tag)
-                            ),
+                            starts_in_thinking=_generation_starts_in_thinking,
                             open_tag=open_tag,
                             close_tag=close_tag,
                         )

@@ -14,6 +14,28 @@ PREDGEN_RESPONSE_TIMING_CONTRACT_VERSION = "predgen_response_availability_v1"
 PREDGEN_RESPONSE_TOKEN_DISTANCE_CONTRACT_VERSION = "response_tokens_v1"
 
 
+def generation_starts_in_thinking(
+    rendered_prompt: str,
+    *,
+    thinking_prefix: str,
+    thinking_mode: bool,
+    model_is_instruct: bool,
+    open_tag: str = "<think>",
+) -> bool:
+    """Return whether the first generated token continues an open think block.
+
+    A normal Qwen thinking prompt ends with the opening marker.  A delta-thinking
+    prompt instead ends with the supplied prefix text, even though that text is
+    inside the same open block.  Looking only at the rendered prompt suffix
+    therefore misclassifies prefixed thinking as response-only generation.
+    """
+    if not thinking_mode or model_is_instruct:
+        return False
+    return bool(str(thinking_prefix or "")) or str(rendered_prompt or "").rstrip().endswith(
+        open_tag
+    )
+
+
 def _encode_without_special_tokens(tokenizer: Any, text: str) -> List[int]:
     try:
         encoded = tokenizer.encode(text, add_special_tokens=False)

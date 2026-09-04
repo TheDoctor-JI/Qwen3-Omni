@@ -12,6 +12,7 @@ from predgen_timing import (
     append_missing_thinking_close_token_ids,
     candidate_is_in_thinking,
     first_response_token_index,
+    generation_starts_in_thinking,
     response_content_is_available,
     split_rendered_thinking_prefix_token_ids,
 )
@@ -59,6 +60,34 @@ class PredGenTimingTests(unittest.TestCase):
         self.assertEqual(first_response_token_index(
             self.tokenizer, [1, 2, 3, 4], starts_in_thinking=True,
         ), 3)
+
+    def test_delta_prefix_starts_inside_thinking_even_when_prompt_ends_in_text(self) -> None:
+        self.assertTrue(generation_starts_in_thinking(
+            "chat-template<think>prior reasoning",
+            thinking_prefix="prior reasoning",
+            thinking_mode=True,
+            model_is_instruct=False,
+        ))
+
+    def test_normal_open_prompt_and_nonthinking_modes(self) -> None:
+        self.assertTrue(generation_starts_in_thinking(
+            "chat-template<think>\n",
+            thinking_prefix="",
+            thinking_mode=True,
+            model_is_instruct=False,
+        ))
+        self.assertFalse(generation_starts_in_thinking(
+            "chat-template<think>prior reasoning",
+            thinking_prefix="prior reasoning",
+            thinking_mode=False,
+            model_is_instruct=False,
+        ))
+        self.assertFalse(generation_starts_in_thinking(
+            "chat-template<think>prior reasoning",
+            thinking_prefix="prior reasoning",
+            thinking_mode=True,
+            model_is_instruct=True,
+        ))
 
     def test_generated_think_block_uses_first_post_think_content_token(self) -> None:
         self.assertEqual(first_response_token_index(
