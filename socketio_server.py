@@ -2932,6 +2932,13 @@ def create_socketio_app(model, processor):
         ping_timeout=600,     # 10 min – thinking-mode generations can run for minutes
         ping_interval=30,     # keep-alive interval; must be < ping_timeout
     )
+    from pathlib import Path as _BudgetPath
+    import sys as _budget_sys
+    _budget_root = str(_BudgetPath(__file__).resolve().parents[1])
+    if _budget_root not in _budget_sys.path:
+        _budget_sys.path.append(_budget_root)
+    from server_token_budget import install_token_budget
+    sio, model = install_token_budget(sio, model)
     app = web.Application()
     sio.attach(app)
 
