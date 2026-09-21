@@ -95,6 +95,42 @@ The built-in GUI supports text, file upload (audio / image / video),
 live microphone recording with waveform visualization, and real-time
 token-by-token streaming output.
 
+### Socket.IO on one or two 72 GB GPUs
+
+The alternative launcher defaults to GPU **1**, an RTX PRO 5000 72GB on
+this host, with tensor parallel size **1** and GPU memory utilization **0.9**.
+These settings override the shared YAML's GPU settings.
+
+```bash
+# Try one 72 GB GPU
+./start_socketio_server_72gb.sh
+
+# Use both 72 GB GPUs if one runs out of memory
+CUDA_VISIBLE_DEVICES=1,2 ./start_socketio_server_72gb.sh
+
+# Thinking checkpoint on one GPU
+CHECKPOINT_PATH=./Qwen3-Omni-30B-A3B-Thinking ./start_socketio_server_72gb.sh
+```
+
+Check GPU indices with `nvidia-smi` on other hosts. The launcher interprets numeric
+`CUDA_VISIBLE_DEVICES` selections as **nvidia-smi indices**, sets
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, and retains numeric IDs for vLLM compatibility.
+It verifies CUDA device UUIDs against the selected nvidia-smi cards before loading
+weights and stops if they disagree. It prints each selected card's name, memory,
+and UUID at startup. Inside the process,
+CUDA renumbers the selected cards starting at GPU 0.
+Tensor parallel size follows
+the number of selected GPUs. Single-card fit is not guaranteed: the server
+retains its 32K context limit and shared YAML concurrency/multimodal settings,
+which also consume memory. The two-GPU option is an explicit retry, not an
+automatic fallback. This launcher does not stop existing servers; stop the old
+server before replacing it, or set `PORT=8903` to use another port (with enough
+free GPU memory).
+
+Optional environment overrides: `GPU_MEMORY_UTILIZATION`, `CHECKPOINT_PATH`,
+`CONFIG_PATH`, `HOST`, `PORT`, `CONDA_SH`, and `CONDA_ENV`. Relative paths resolve
+from the Qwen3-Omni directory. Additional server CLI arguments can be appended.
+
 ### Option C — Transformers backend (streaming + audio output)
 
 ```bash
