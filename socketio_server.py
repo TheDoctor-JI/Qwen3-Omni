@@ -586,23 +586,6 @@ async def _stream_generate(sio, sid, model, processor, payload,
     open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
     close_tag = SERVER_CONFIG.get('thinking', {}).get('close_tag', '</think>')
 
-    # Offload blocking preprocessing (base64 decode, tokenization,
-    # audio/image feature extraction) to a worker thread so the event
-    # loop stays responsive for new connections and other events.
-    inputs, sampling_params, temp_files, confirmed_items = await asyncio.to_thread(
-        _prepare_inputs, processor, payload, session_cache,
-    )
-
-    # Notify client which items are confirmed in the encoding cache.
-    # Emitted before generation_start so the client has acks before tokens.
-    if confirmed_items:
-        await sio.emit("items_cached", {
-            "request_id": request_id,
-            "items": confirmed_items,
-        }, to=sid)
-
-    await sio.emit("generation_start", {"request_id": request_id}, to=sid)
-
     t_start      = time.perf_counter()
     prev_text    = ""
     n_tokens     = 0
@@ -610,7 +593,26 @@ async def _stream_generate(sio, sid, model, processor, payload,
     _think_started = False
     _think_ended   = False
 
+    temp_files = []
     try:
+        # Offload blocking preprocessing (base64 decode, tokenization,
+        # audio/image feature extraction) to a worker thread so the event
+        # loop stays responsive for new connections and other events.
+        inputs, sampling_params, temp_files, confirmed_items = await asyncio.to_thread(
+            _prepare_inputs, processor, payload, session_cache,
+        )
+
+        # Notify client which items are confirmed in the encoding cache.
+        # Emitted before generation_start so the client has acks before tokens.
+        if confirmed_items:
+            await sio.emit("items_cached", {
+                "request_id": request_id,
+                "items": confirmed_items,
+            }, to=sid)
+
+        await sio.emit("generation_start", {"request_id": request_id}, to=sid)
+
+        t_start = time.perf_counter()
         async for output in model.generate(inputs, sampling_params, request_id):
             full_text = output.outputs[0].text
             if thinking_mode and prime_thinking:
@@ -735,56 +737,87 @@ def create_socketio_app(model, processor):
     _active = {}   # sid -> (asyncio.Task, request_id: str)
     _session_caches: Dict[str, MmItemCache] = {}  # sid -> per-session encoding cache
 
-    async def _abort_active(sid, reason: str):
-        """Cancel the active task for *sid* and abort the vLLM request.
+    # Socket.IO handlers may overlap even on one connection.
+    _session_locks = {}
 
-        Calls model.abort(request_id) to immediately stop engine-side token
-        generation, then cancels the asyncio task so CancelledError propagates
-        and the server emits generation_stopped.  Abort failures are logged
-        but never raised — cancellation is solely client-driven.
-        """
-        entry = _active.pop(sid, None)
-        if entry is None:
-            return
+    async def _abort_active(sid, reason: str, request_id=None):
+        """Called under the session lock; acknowledge only after shutdown."""
+        entry = _active.get(sid)
+        if entry is None or (request_id is not None and entry[1] != request_id):
+            return {'ok': True, 'request_id': request_id, 'status': 'already_stopped'}
         task, req_id = entry
         if task and not task.done():
-            try:
-                await model.abort(req_id)
-            except Exception as e:
-                _logger.warning(f"model.abort({req_id}) failed ({reason}): {e}")
+            # Stop the coroutine first, so it cannot submit to vLLM after abort.
             task.cancel()
-            _logger.info(f"{reason}: cancelled task for sid={sid} (request_id={req_id})")
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                _logger.exception(f"Generation task failed during {reason}: {req_id}")
+        try:
+            await model.abort(req_id)
+        except Exception as exc:
+            # Keep the entry so subsequent requests cannot bypass a failed abort.
+            _logger.warning(f"model.abort({req_id}) failed ({reason}): {exc}")
+            return {'ok': False, 'request_id': req_id, 'error': str(exc)}
+        _active.pop(sid, None)
+        return {'ok': True, 'request_id': req_id, 'status': 'stopped'}
 
     @sio.on("connect")
     async def on_connect(sid, environ):
         _logger.info(f"connect    sid={sid}")
+        _session_locks[sid] = asyncio.Lock()
         _session_caches[sid] = MmItemCache()
         await sio.emit("server_ready", {"sid": sid}, to=sid)
 
     @sio.on("disconnect")
     async def on_disconnect(sid):
-        _logger.info(f"disconnect sid={sid}")
-        cache = _session_caches.pop(sid, None)
-        if cache is not None:
-            _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
-        await _abort_active(sid, "disconnect")
+        lock = _session_locks.get(sid)
+        if lock is None:
+            return
+        async with lock:
+            _logger.info(f"disconnect sid={sid}")
+            cache = _session_caches.pop(sid, None)
+            if cache is not None:
+                _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
+            await _abort_active(sid, "disconnect")
+            _active.pop(sid, None)
+            _session_locks.pop(sid, None)
 
     @sio.on("generate")
     async def on_generate(sid, payload):
-        # Cancel any in-flight generation before starting a new one
-        await _abort_active(sid, "new generate")
-        request_id = payload.get('request_id') or str(uuid.uuid4())
-        # Inject the resolved request_id back so _stream_generate uses it
-        payload['request_id'] = request_id
-        task = asyncio.create_task(
-            _stream_generate(sio, sid, model, processor, payload,
-                             session_cache=_session_caches.get(sid))
-        )
-        _active[sid] = (task, request_id)
+        lock = _session_locks.get(sid)
+        if lock is None:
+            return
+        async with lock:
+            if sid not in _session_caches:
+                return
+            request_id = payload.get('request_id') or str(uuid.uuid4())
+            result = await _abort_active(sid, "new generate")
+            if not result['ok']:
+                await sio.emit('generation_error', {
+                    'request_id': request_id, 'error': 'Previous generation cancellation failed',
+                }, to=sid)
+                return
+            payload['request_id'] = request_id
+            task = asyncio.create_task(
+                _stream_generate(sio, sid, model, processor, payload,
+                                 session_cache=_session_caches.get(sid))
+            )
+            _active[sid] = (task, request_id)
 
     @sio.on("stop")
     async def on_stop(sid, payload=None):
-        await _abort_active(sid, "stop")
+        request_id = (payload or {}).get('request_id')
+        lock = _session_locks.get(sid)
+        if lock is None:
+            return {'ok': False, 'request_id': request_id, 'error': 'Disconnected'}
+        async with lock:
+            if sid not in _session_caches:
+                return {'ok': False, 'request_id': request_id, 'error': 'Disconnected'}
+            return await _abort_active(sid, "stop", request_id=request_id)
 
     async def handle_index(request):
         return web.Response(text=_GUI_HTML, content_type="text/html")
