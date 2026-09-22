@@ -1,8 +1,8 @@
 #!/bin/bash
 
 
-# Also kill any lingering Qwen3-Omni / vLLM processes related to this server
-pkill -9 -f "socketio_server.py" 2>/dev/null || true
+# Cleanup below is scoped to the configured listener via runtime_launch.py.
+# Disabled: global socketio_server.py cleanup would kill the experiment on 8902.
 
 
 # Activate the conda environment
@@ -17,7 +17,7 @@ CONFIG_PATH="../AudioLLMInterface/MultiModalLLM/mm_llm_config.yaml"
 # --checkpoint-path ./Qwen3-Omni-30B-A3B-Instruct \
 # --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \
 
-python socketio_server.py \
-    --checkpoint-path ./Qwen3-Omni-30B-A3B-Instruct \
+exec python ../runtime_launch.py --config "$CONFIG_PATH" --section model --clear-port --append-port -- python socketio_server.py \
+    --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \
     --config "$CONFIG_PATH" \
-    --host 0.0.0.0 --port 8902
+    --host 0.0.0.0

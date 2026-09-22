@@ -13,9 +13,9 @@ Additional requirements beyond web_demo.py:
 Usage:
     python socketio_server.py \\
         --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \\
-        --host 127.0.0.1 --port 8902
+        --host 127.0.0.1 --port 8903
 
-    Then open  http://127.0.0.1:8902  in your browser.
+    Then open  http://127.0.0.1:8903  in your browser.
 
 Socket.IO protocol
 ------------------
@@ -201,14 +201,22 @@ def _load_model_processor(args):
     max_new_mm = int(model_cfg.get('max_new_mm_per_request', 20))
     global _MAX_NEW_MM_PER_REQUEST
     _MAX_NEW_MM_PER_REQUEST = max_new_mm
+    parallel_size = int(model_cfg.get('tensor_parallel_size', 1))
+    memory_fraction = float(model_cfg.get('gpu_memory_utilization', 0.9))
+    if not 1 <= parallel_size <= torch.cuda.device_count():
+        raise ValueError('tensor_parallel_size exceeds available visible GPUs')
+    if not 0 < memory_fraction <= 1:
+        raise ValueError('gpu_memory_utilization must be in (0, 1]')
+    _logger.info(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
+                 f"tensor_parallel_size={parallel_size}, gpu_memory_utilization={memory_fraction}")
     engine_args = AsyncEngineArgs(
         model=args.checkpoint_path,
         trust_remote_code=True,
-        gpu_memory_utilization=0.7,
-        tensor_parallel_size=torch.cuda.device_count(),
+        gpu_memory_utilization=memory_fraction,
+        tensor_parallel_size=parallel_size,
         limit_mm_per_prompt={'image': limit_image, 'video': limit_video, 'audio': limit_audio},
         max_num_seqs=max_num_seqs,
-        max_model_len=32768,
+        max_model_len=int(model_cfg.get('max_model_len', 32768)),
         seed=1234,
         enable_prefix_caching=enable_prefix_cache,
     )
@@ -1996,10 +2004,13 @@ def _get_args():
         help="Bind host (default: 127.0.0.1; use 0.0.0.0 to expose on LAN)",
     )
     parser.add_argument(
-        "--port", type=int, default=8902,
-        help="Bind port (default: 8902)",
+        "--port", type=int, default=None,
+        help="Bind port (default: socketio.port from YAML, otherwise 8903)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.port is None:
+        args.port = int(_load_config(args.config).get('socketio', {}).get('port', 8903))
+    return args
 
 
 if __name__ == "__main__":

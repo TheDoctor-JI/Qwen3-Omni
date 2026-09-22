@@ -9,8 +9,8 @@ Three test modes:
                   an unseen item, verifying the per-item lock.
 
 Usage:
-    # Run all tests against a server on localhost:8902
-    python test_encoding_cache.py --host 127.0.0.1 --port 8902
+    # Run all tests against a server on localhost:8903
+    python test_encoding_cache.py --host 127.0.0.1 --port 8903
 
     # Run only the chunked test with 6 chunks
     python test_encoding_cache.py --test chunked --num-chunks 6
@@ -363,7 +363,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', type=int, default=8902)
+    parser.add_argument('--port', type=int, default=8903)
     parser.add_argument('--test', choices=['all', 'single', 'chunked', 'concurrent'],
                         default='all', help='Which test to run (default: all)')
     parser.add_argument('--duration-sec', type=float, default=3600.0,
