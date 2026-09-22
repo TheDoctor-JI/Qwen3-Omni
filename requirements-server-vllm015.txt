@@ -1,0 +1,13 @@
+# Isolated Qwen Socket.IO server environment, Python 3.11.
+# Do not combine with intelligence_instance_requirements.txt (different torch pin).
+# vLLM 0.15 provides its own Qwen audio encoder; external flash-attn is not needed.
+vllm==0.15.0
+transformers==4.57.5
+qwen-omni-utils==0.0.9
+python-socketio[asyncio_client]==5.16.1
+aiohttp==3.13.3
+PyYAML>=6.0.2,<7
+soundfile==0.13.1
+librosa==0.11.0
+av==16.1.0
+websocket-client>=1.8,<2

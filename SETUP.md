@@ -1,61 +1,41 @@
 # Qwen3-Omni — Setup Guide
 
 ## Requirements
-- NVIDIA **B200** (or other Blackwell / 50-series data-centre) GPU(s) with **≥79 GB** total VRAM (BF16)
+- A **72GB Blackwell** passed the current vLLM server smoke test (BF16, 32K context, max_num_seqs=2). Larger multimodal workloads or the full Transformers model can require more memory.
 - CUDA **12.8** driver (`nvidia-smi` should report ≥ 12.8)
 - Miniconda / Anaconda
 
 ---
 
-## 1. Create conda environment
+## Server environment: vLLM 0.15.0
+
+All Socket.IO launch scripts in this directory now default to
+`qwen3omni-vllm015`. The old `qwen3omni` environment can remain installed.
+The 72GB launcher, where present, still supports an explicit `CONDA_ENV` override.
+
+From this directory:
 
 ```bash
-conda create -n qwen3omni python=3.11 -y
-conda activate qwen3omni
+conda create -n qwen3omni-vllm015 python=3.11 pip -y
+conda activate qwen3omni-vllm015
+python -m pip install -r requirements-server-vllm015.txt
+python -m pip check
 ```
 
-## 2. Install PyTorch (CUDA 12.8)
-
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
-
-## 3. Install vLLM
-
-```bash
-pip install vllm==0.13.0
-```
-
-## 4. Install Transformers and utilities
-
-```bash
-pip install transformers==4.57.3 accelerate
-pip install "huggingface_hub>=0.34.0,<1.0"
-pip install qwen-omni-utils -U
-```
-
-## 5. Install Gradio and audio dependencies (web_demo.py)
-
-```bash
-pip install gradio==5.44.1 gradio_client==1.12.1 soundfile==0.13.1
-```
-
-## 6. Install Socket.IO dependencies (socketio_server.py)
-
-```bash
-pip install "python-socketio[asyncio_client]" aiohttp
-```
-
-## 7. Install FlashAttention 2 (optional but recommended)
-
-```bash
-pip install -U flash-attn --no-build-isolation
-```
-
-## 8. Install ffmpeg
+This installs vLLM 0.15.0, its required PyTorch 2.9.1 stack, Transformers 4.57.5,
+and the Socket.IO/audio dependencies. vLLM's native Qwen audio encoder avoids
+our old external FlashAttention binary's Blackwell incompatibility. Do not
+install external `flash-attn` for this vLLM server. Keep FFmpeg on PATH:
 
 ```bash
 conda install -c conda-forge ffmpeg -y
+```
+
+The separate Gradio/Transformers demos need additional dependencies and have
+not been validated in this server environment:
+
+```bash
+python -m pip install gradio==5.44.1 gradio_client==1.12.1 accelerate
 ```
 
 ## 9. Download the model

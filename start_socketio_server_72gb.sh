@@ -20,7 +20,7 @@ if [[ ${#GPU_IDS[@]} -eq 2 && "${GPU_IDS[0]}" == "${GPU_IDS[1]}" ]]; then
 fi
 
 source "${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
-conda activate "${CONDA_ENV:-qwen3omni}"
+conda activate "${CONDA_ENV:-qwen3omni-vllm015}"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES
@@ -52,7 +52,7 @@ PY
 
 echo "Starting Qwen3-Omni with CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES, tensor parallel size ${#GPU_IDS[@]}, memory utilization ${GPU_MEMORY_UTILIZATION:-0.9}"
 exec python socketio_server.py \
-    --checkpoint-path "${CHECKPOINT_PATH:-./Qwen3-Omni-30B-A3B-Instruct}" \
+    --checkpoint-path "${CHECKPOINT_PATH:-./Qwen3-Omni-30B-A3B-Thinking}" \
     --config "${CONFIG_PATH:-../AudioLLMInterface/MultiModalLLM/mm_llm_config.yaml}" \
     --host "${HOST:-0.0.0.0}" --port "${PORT:-8902}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.9}" \
