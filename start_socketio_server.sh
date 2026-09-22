@@ -7,7 +7,7 @@
 
 # Activate the conda environment
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate qwen3omni
+conda activate qwen3omni-vllm015
 
 # Launch the Socket.IO server
 cd "$(dirname "${BASH_SOURCE[0]}")"
