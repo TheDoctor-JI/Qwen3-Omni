@@ -1,8 +1,8 @@
 #!/bin/bash
 
 
-# Cleanup below is scoped to the configured listener via runtime_launch.py.
-# Disabled: global socketio_server.py cleanup would kill the experiment on 8902.
+# Production always binds 8899. An occupied port must fail without killing its owner.
+# Other model servers are independent of this launch.
 
 
 # Activate the conda environment
@@ -17,7 +17,7 @@ CONFIG_PATH="../AudioLLMInterface/MultiModalLLM/mm_llm_config.yaml"
 # --checkpoint-path ./Qwen3-Omni-30B-A3B-Instruct \
 # --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \
 
-exec python ../runtime_launch.py --config "$CONFIG_PATH" --section model --clear-port --append-port -- python socketio_server.py \
+exec python ../runtime_launch.py --config "$CONFIG_PATH" --section model --production-qwen --append-port -- python socketio_server.py \
     --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \
     --config "$CONFIG_PATH" \
     --host 0.0.0.0
