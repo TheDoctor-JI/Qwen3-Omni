@@ -67,10 +67,10 @@ Open `http://<server-ip>:8901` in your browser.
 ```bash
 python socketio_server.py \
     --checkpoint-path ./Qwen3-Omni-30B-A3B-Instruct \
-    --host 0.0.0.0 --port 8903
+    --host 0.0.0.0 --port 8899
 ```
 
-Open `http://<server-ip>:8903` in your browser.
+Open `http://<server-ip>:8899` in your browser.
 The built-in GUI supports text, file upload (audio / image / video),
 live microphone recording with waveform visualization, and real-time
 token-by-token streaming output.

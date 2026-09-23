@@ -13,9 +13,9 @@ Additional requirements beyond web_demo.py:
 Usage:
     python socketio_server.py \\
         --checkpoint-path ./Qwen3-Omni-30B-A3B-Thinking \\
-        --host 127.0.0.1 --port 8903
+        --host 127.0.0.1 --port 8899
 
-    Then open  http://127.0.0.1:8903  in your browser.
+    Then open  http://127.0.0.1:8899  in your browser.
 
 Socket.IO protocol
 ------------------
@@ -2005,11 +2005,11 @@ def _get_args():
     )
     parser.add_argument(
         "--port", type=int, default=None,
-        help="Bind port (default: socketio.port from YAML, otherwise 8903)",
+        help="Bind port (default: socketio.port from YAML, otherwise 8899)",
     )
     args = parser.parse_args()
     if args.port is None:
-        args.port = int(_load_config(args.config).get('socketio', {}).get('port', 8903))
+        args.port = int(_load_config(args.config).get('socketio', {}).get('port', 8899))
     return args
 
 
