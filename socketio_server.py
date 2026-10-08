@@ -2071,13 +2071,14 @@ async def _predgen_style_generation(
     This is deliberately independent of ``_stream_generate``.  The candidate
     is an opaque token-ID sequence owned by the caller.  Verification uses
     vLLM prompt log-probabilities and retains the longest prefix whose tokens
-    all have rank <= ``verification_top_k``.
+    all have rank <= ``verification_top_k``. A value of -1 accepts the whole
+    candidate without executing the verification forward pass.
     """
     request_id = str(payload.get("request_id") or uuid.uuid4())
     params = payload.get("params") or {}
     verification_top_k = int(payload.get("verification_top_k", 3))
-    if verification_top_k < 1:
-        raise ValueError("verification_top_k must be at least 1")
+    if verification_top_k != -1 and verification_top_k < 1:
+        raise ValueError("verification_top_k must be at least 1 or -1 to skip verification")
 
     candidate_thinking_text_supplied = "candidate_thinking_text" in payload
     candidate_thinking_text = str(payload.get("candidate_thinking_text") or "")
@@ -2309,60 +2310,70 @@ async def _predgen_style_generation(
         if _deadline_reached():
             timed_out = True
         elif candidate_token_ids:
-            from vllm import SamplingParams
-
-            verify_started_at = time.perf_counter()
-            verify_params = SamplingParams(
-                temperature=0.0,
-                max_tokens=1,
-                prompt_logprobs=verification_top_k,
-            )
-            verify_request_id = f"{request_id}:verify"
-            active_engine_request_id = verify_request_id
-            verify_output = None
-            verify_inputs = _predgen_inputs_with_token_ids(
-                inputs,
-                base_prompt_token_ids + candidate_token_ids,
-            )
-            async for output in model.generate(verify_inputs, verify_params, verify_request_id):
-                verify_output = output
-                if _deadline_reached():
-                    timed_out = True
-                    await model.abort(verify_request_id)
-                    break
-            verification_duration = time.perf_counter() - verify_started_at
-            active_engine_request_id = None
-
-            # If the forward pass did not finish, its ranks are not authoritative;
-            # preserve the incoming candidate unchanged for the next offset.
-            if verify_output is not None and getattr(verify_output, "finished", False):
+            if verification_top_k == -1:
+                # Explicit accept-all ablation: no verification engine request.
+                # Keep the candidate intact and use the normal continuation path.
                 verification_completed = True
-                prompt_logprobs = getattr(verify_output, "prompt_logprobs", None)
-                if not isinstance(prompt_logprobs, list):
-                    raise RuntimeError("vLLM did not return prompt_logprobs for PredGen verification")
-                returned_prompt_ids = getattr(verify_output, "prompt_token_ids", None)
-                if not isinstance(returned_prompt_ids, (list, tuple)):
-                    raise RuntimeError("vLLM did not return prompt_token_ids for PredGen alignment")
-                returned_prompt_ids = [int(token_id) for token_id in returned_prompt_ids]
-                if len(returned_prompt_ids) < len(candidate_token_ids):
-                    raise RuntimeError("vLLM returned fewer prompt tokens than the candidate length")
-                candidate_start = len(returned_prompt_ids) - len(candidate_token_ids)
-                if returned_prompt_ids[candidate_start:] != candidate_token_ids:
-                    raise RuntimeError("PredGen candidate is not the returned vLLM prompt suffix")
-                for offset, token_id in enumerate(candidate_token_ids):
-                    position = candidate_start + offset
-                    if position >= len(prompt_logprobs):
-                        raise RuntimeError(
-                            "vLLM prompt_logprobs was shorter than the verified prompt"
-                        )
-                    rank = _predgen_candidate_rank(prompt_logprobs[position], token_id)
-                    candidate_ranks.append(int(rank) if rank is not None else -1)
-                    if rank is None or rank > verification_top_k:
-                        rejection_index = offset
-                        accepted_token_ids = candidate_token_ids[:offset]
-                        break
                 verification_completed_elapsed = time.perf_counter() - started_at
+            else:
+                from vllm import SamplingParams
 
+                verify_started_at = time.perf_counter()
+                verify_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=1,
+                    prompt_logprobs=verification_top_k,
+                )
+                verify_request_id = f"{request_id}:verify"
+                active_engine_request_id = verify_request_id
+                verify_output = None
+                verify_inputs = _predgen_inputs_with_token_ids(
+                    inputs,
+                    base_prompt_token_ids + candidate_token_ids,
+                )
+                async for output in model.generate(verify_inputs, verify_params, verify_request_id):
+                    verify_output = output
+                    if _deadline_reached():
+                        timed_out = True
+                        await model.abort(verify_request_id)
+                        break
+                verification_duration = time.perf_counter() - verify_started_at
+                active_engine_request_id = None
+
+                # If the forward pass did not finish, its ranks are not authoritative;
+                # preserve the incoming candidate unchanged for the next offset.
+                if verify_output is not None and getattr(verify_output, "finished", False):
+                    verification_completed = True
+                    prompt_logprobs = getattr(verify_output, "prompt_logprobs", None)
+                    if not isinstance(prompt_logprobs, list):
+                        raise RuntimeError("vLLM did not return prompt_logprobs for PredGen verification")
+                    returned_prompt_ids = getattr(verify_output, "prompt_token_ids", None)
+                    if not isinstance(returned_prompt_ids, (list, tuple)):
+                        raise RuntimeError("vLLM did not return prompt_token_ids for PredGen alignment")
+                    returned_prompt_ids = [int(token_id) for token_id in returned_prompt_ids]
+                    if len(returned_prompt_ids) < len(candidate_token_ids):
+                        raise RuntimeError("vLLM returned fewer prompt tokens than the candidate length")
+                    candidate_start = len(returned_prompt_ids) - len(candidate_token_ids)
+                    if returned_prompt_ids[candidate_start:] != candidate_token_ids:
+                        raise RuntimeError("PredGen candidate is not the returned vLLM prompt suffix")
+                    for offset, token_id in enumerate(candidate_token_ids):
+                        position = candidate_start + offset
+                        if position >= len(prompt_logprobs):
+                            raise RuntimeError(
+                                "vLLM prompt_logprobs was shorter than the verified prompt"
+                            )
+                        rank = _predgen_candidate_rank(prompt_logprobs[position], token_id)
+                        candidate_ranks.append(int(rank) if rank is not None else -1)
+                        if rank is None or rank > verification_top_k:
+                            rejection_index = offset
+                            accepted_token_ids = candidate_token_ids[:offset]
+                            break
+                    verification_completed_elapsed = time.perf_counter() - started_at
+
+                elif not timed_out:
+                    raise RuntimeError("PredGen verification ended without a finished vLLM output")
+
+            if verification_completed:
                 accepted_response_index = first_response_token_index(
                     tokenizer,
                     accepted_token_ids,
@@ -2380,8 +2391,7 @@ async def _predgen_style_generation(
                     first_response_token_at = (
                         started_at + verification_completed_elapsed
                     )
-            elif not timed_out:
-                raise RuntimeError("PredGen verification ended without a finished vLLM output")
+
 
         fully_accepted = rejection_index is None
         accepted_ratio = (
@@ -2784,6 +2794,7 @@ async def _predgen_style_generation(
             "rejected_at_token_index": rejection_index,
             "candidate_ranks": candidate_ranks,
             "verification_completed": verification_completed or not candidate_token_ids,
+            "verification_skipped": verification_top_k == -1,
             "verification_timed_out": bool(
                 timed_out and candidate_token_ids and not verification_completed
             ),

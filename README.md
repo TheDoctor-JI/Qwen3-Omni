@@ -2195,3 +2195,19 @@ If you find our paper and code useful in your research, please consider giving a
 ```
 
 <br>
+
+### PredGen accept-all experiment
+
+The dedicated PredGen endpoint accepts `verification_top_k: -1` to retain all
+prior candidate tokens without a verification forward pass. Positive values
+keep normal top-k verification; zero and other negative values are invalid.
+Continuation, token/time budgets, candidate fingerprints and token validation
+remain unchanged. Finished candidates are reused; unfinished candidates continue
+from their full prefix. Responses record `verification_skipped: true`, zero
+verification duration and no candidate ranks for this mode. First-response timing
+still includes request preparation before the prefix is accepted.
+
+For the incremental evaluator, set `pred_gen.verification_top_k: -1` in
+`runtime_bundle/model_runtime_config.yaml`. This sentinel is implemented here
+for Qwen3; other model servers may reject it. Restart an already-running Qwen3
+server after updating its code.
