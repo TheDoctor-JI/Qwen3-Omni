@@ -597,6 +597,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
     t_start      = time.perf_counter()
     prev_text    = ""
     n_tokens     = 0
+    last_token_ids = ()
     ttft         = None
     _think_started = False
     _think_ended   = False
@@ -623,6 +624,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
         t_start = time.perf_counter()
         async for output in model.generate(inputs, sampling_params, request_id):
             full_text = output.outputs[0].text
+            last_token_ids = output.outputs[0].token_ids
             if thinking_mode and prime_thinking:
                 full_text = open_tag + "\n" + full_text
             
@@ -674,6 +676,9 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
         total_time = time.perf_counter() - t_start
         tps = n_tokens / total_time if total_time > 0 else 0.0
+        # Preserve evidence of missing wrappers before any client-side parsing.
+        _logger.debug("[%s] Streamed generation text: %r", request_id, prev_text)
+        _logger.debug("[%s] Generated token IDs: %s", request_id, last_token_ids)
         if _think_started:
             _logger.info(
                 f"[{request_id}] Generation complete: {n_tokens} tokens, {tps:.1f} tps, "
