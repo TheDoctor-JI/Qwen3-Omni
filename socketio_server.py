@@ -22,9 +22,16 @@ Socket.IO protocol
   Client → Server events:
     "generate"  { messages: [{role, content: [{type, ...}]}],
                   params:{temperature,top_p,top_k,
-                  max_tokens,thinking_mode},
+                  max_tokens,thinking_mode,response_prefix?},
                   request_id? }   — request_id is optional; server generates one if absent
     "stop"      { request_id? }  — cancel the running generation
+
+  params.response_prefix is an optional assistant prefill string, echoed once
+  in streamed/terminal text. Nonempty prefixes require an Instruct checkpoint
+  and thinking_mode=False, without thinking_prefix or prime_thinking. Checkpoint
+  detection relies on "instruct" in the loaded checkpoint path (case-insensitive);
+  local directory aliases must retain that marker. Prefixes do not count toward
+  model-generated tokens. The server assigns no semantics to the prefix.
 
   Server → Client events:
     "server_ready"         { sid }
@@ -475,6 +482,20 @@ def _process_mm_info_cached(
 # Preprocessing (synchronous — run in a thread to keep the event loop free)
 # ---------------------------------------------------------------------------
 
+def _response_prefix(params):
+    """Resolve a generic assistant prefill; checkpoint names identify Instruct."""
+    prefix = params.get('response_prefix', '')
+    if not isinstance(prefix, str):
+        raise ValueError('response_prefix must be a string')
+    if prefix:
+        if not _MODEL_IS_INSTRUCT:
+            raise ValueError('response_prefix requires an Instruct checkpoint (path must contain instruct)')
+        if (params.get('thinking_mode', True) or params.get('prime_thinking', False)
+                or params.get('thinking_prefix', '')):
+            raise ValueError('response_prefix requires native thinking and priming disabled')
+    return prefix
+
+
 def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = None):
     """Build vLLM inputs from a Socket.IO payload.
 
@@ -502,13 +523,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         f"max_tokens={max_tokens}, temperature={temperature}"
     )
 
-    template_enable_thinking = thinking_mode
-    if _MODEL_IS_INSTRUCT and not thinking_mode:
-        _logger.warning(
-            f"[{request_id}] enable thinking is not active for instruct model; "
-            f"ignoring thinking_mode=False and proceeding without think-tag suppression"
-        )
-        template_enable_thinking = True
+    response_prefix = _response_prefix(p)
 
     messages, temp_files = _build_messages(payload)
     _logger.info(
@@ -533,11 +548,11 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
             f"Consider reducing context window size."
         )
 
+    # Match the official Instruct recipe: omit enable_thinking so its template
+    # does not insert an empty native <think> block before the assistant output.
+    template_options = {} if _MODEL_IS_INSTRUCT else {'enable_thinking': thinking_mode}
     prompt_text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=template_enable_thinking,
+        messages, tokenize=False, add_generation_prompt=True, **template_options,
     )
 
     thinking_prefix = p.get('thinking_prefix', '') or ''
@@ -552,6 +567,10 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
         open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
         prompt_text += open_tag + "\n"
         _logger.debug(f"[{request_id}] Primed prompt with {open_tag}\\n")
+
+    if response_prefix:
+        prompt_text += response_prefix
+        _logger.debug("[%s] Prefilled response_prefix: %r", request_id, response_prefix)
 
     _logger.debug(
         f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
@@ -604,6 +623,9 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
     temp_files = []
     try:
+        response_prefix = _response_prefix(p)
+        previous_model_text = ""
+        saw_output = False
         # Offload blocking preprocessing (base64 decode, tokenization,
         # audio/image feature extraction) to a worker thread so the event
         # loop stays responsive for new connections and other events.
@@ -623,18 +645,25 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
         t_start = time.perf_counter()
         async for output in model.generate(inputs, sampling_params, request_id):
-            full_text = output.outputs[0].text
-            last_token_ids = output.outputs[0].token_ids
+            saw_output = True
+            model_text = output.outputs[0].text
+            last_token_ids = getattr(output.outputs[0], 'token_ids', ())
+            if last_token_ids:
+                n_tokens = len(last_token_ids)
+            full_text = response_prefix + model_text
             if thinking_mode and prime_thinking:
                 full_text = open_tag + "\n" + full_text
             
             delta = full_text[len(prev_text):]
             if delta:
                 elapsed = time.perf_counter() - t_start
-                if ttft is None:
-                    ttft = elapsed
-                    _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
-                n_tokens += 1
+                if model_text != previous_model_text:
+                    if ttft is None:
+                        ttft = elapsed
+                        _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
+                    # vLLM returns cumulative generated IDs, excluding prefill.
+                    if not last_token_ids:
+                        n_tokens += 1
 
                 # Detect thinking block transitions and log them
                 if not _think_started and open_tag in full_text:
@@ -653,7 +682,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                     "full_text":  full_text,
                     "num_tokens": n_tokens,
                     "elapsed":    round(elapsed, 3),
-                    "ttft":       round(ttft, 3),
+                    "ttft":       round(ttft, 3) if ttft is not None else None,
                     "finished":   output.finished,
                 }
 
@@ -673,7 +702,10 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
                 await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
+            previous_model_text = model_text
 
+        if not saw_output:
+            raise RuntimeError('Model generation ended without any output')
         total_time = time.perf_counter() - t_start
         tps = n_tokens / total_time if total_time > 0 else 0.0
         # Preserve evidence of missing wrappers before any client-side parsing.
