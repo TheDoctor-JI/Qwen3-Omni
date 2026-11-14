@@ -20,6 +20,8 @@ Usage:
 Socket.IO protocol
 ------------------
   Client → Server events:
+    "register_context" {process_id, interaction_id} — context-owner control only
+    "retire_context"   {process_id, interaction_id} — retire cache/abort attached work
     "generate"  { messages: [{role, content: [{type, ...}]}],
                   params:{temperature,top_p,top_k,
                   max_tokens,thinking_mode,response_prefix?},
@@ -57,6 +59,8 @@ Socket.IO protocol
     "generation_error"     { request_id, error }
 
 Message format (inside "messages"):
+    Protocol-1 shared-media views and context namespace lifetime are documented
+    in SHARED_CONTEXT_PROTOCOL.md. They coexist with the legacy formats below.
     Each message is {role: str, content: [{type, ...}]}.
     Text items:  {type: "text", text: "..."}
     Audio items: {type: "audio", data: "<base64>", suffix: ".wav"}
@@ -78,7 +82,12 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# Shared wire helpers are lightweight; the standalone legacy route still works
+# without a sibling client checkout because these imports occur only on new input.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 import yaml
@@ -121,10 +130,17 @@ class MmItemCache:
         self._cache: Dict[Tuple[str, str], Any] = {}
         self._item_locks: Dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
+        self._retired = False
 
     @staticmethod
     def meta_key_for(item: dict) -> str:
         """Derive a metadata fingerprint from an annotated content item."""
+        if item.get('media') is not None:
+            from mm_llm_interface.protocol import view_key
+            key = view_key(item['media'])
+            if item.get('view_key') != key:
+                raise ValueError('Mismatched exposed audio view identity')
+            return key
         dur = item.get('duration_ms', '?')
         sr = item.get('sample_rate', '?')
         return f"{dur}ms_{sr}hz"
@@ -132,6 +148,8 @@ class MmItemCache:
     def get(self, item_id: str, meta_key: str) -> Optional[Any]:
         """Return the cached encoding or None."""
         with self._lock:
+            if self._retired:
+                raise ValueError('Retired context cache')
             return self._cache.get((item_id, meta_key))
 
     def get_or_encode(
@@ -149,6 +167,8 @@ class MmItemCache:
         """
         # Fast path — already cached
         with self._lock:
+            if self._retired:
+                raise ValueError('Retired context cache')
             cached = self._cache.get((item_id, meta_key))
             if cached is not None:
                 return cached, False
@@ -160,13 +180,23 @@ class MmItemCache:
         # Slow path — hold per-item lock, double-check, then encode
         with item_lock:
             with self._lock:
+                if self._retired:
+                    raise ValueError('Retired context cache')
                 cached = self._cache.get((item_id, meta_key))
                 if cached is not None:
                     return cached, False
             result = encode_fn()
             with self._lock:
+                if self._retired:
+                    raise ValueError('Retired context cache')
                 self._cache[(item_id, meta_key)] = result
             return result, True
+
+    def retire(self):
+        with self._lock:
+            self._retired = True
+            self._cache.clear()
+            self._item_locks.clear()
 
     def __len__(self) -> int:
         with self._lock:
@@ -299,7 +329,14 @@ def _build_messages(payload):
         for item in raw_content:
             item_type = item.get("type", "text")
 
-            if item_type in default_suffixes and item.get("data"):
+            if item_type == 'audio' and item.get('media') is not None:
+                if payload.get('protocol_version') != 1 or not payload.get('context'):
+                    raise ValueError('Shared media requires protocol_version=1 and a context namespace')
+                if not item.get('item_id'):
+                    raise ValueError('Shared media requires item_id')
+                out_content.append(dict(item, audio='shared-context://' + item['item_id']))
+
+            elif item_type in default_suffixes and item.get("data"):
                 # Inline base64 media — materialise to temp file
                 suffix = item.get("suffix") or default_suffixes[item_type]
                 path = _save_temp_b64(item["data"], suffix)
@@ -359,6 +396,31 @@ def _encode_single_mm_item(item_type: str, file_path: str):
     if result_list is not None and len(result_list) > 0:
         return result_list[0]
     return None
+
+
+def _encode_shared_audio(media):
+    """Map only a captured immutable view; preprocessing/GPU transfers may copy."""
+    import mmap
+    import numpy as np
+    from mm_llm_interface.protocol import validate_media
+    validate_media(media)
+    start, end = media['start_frame'] * 2, media['end_frame'] * 2
+    waveform = np.empty(media['end_frame'] - media['start_frame'], dtype=np.float32)
+    logical = written = 0
+    for block in media['blocks']:
+        lo, hi = max(start, logical), min(end, logical + block['length'])
+        if lo < hi:
+            with open(block['path'], 'rb') as backing:
+                with mmap.mmap(backing.fileno(), block['capacity'], access=mmap.ACCESS_READ) as mapping:
+                    samples = np.frombuffer(mapping, dtype='<i2', count=(hi - lo) // 2,
+                                            offset=lo - logical + block.get('start', 0))
+                    count = len(samples)
+                    waveform[written:written + count] = samples
+                    del samples  # release the NumPy view before closing the mapping
+                    written += count
+        logical += block['length']
+    waveform /= 32768.0
+    return _encode_single_mm_item('audio', waveform)
 
 
 def _process_mm_info_cached(
@@ -432,10 +494,11 @@ def _process_mm_info_cached(
             if session_cache is not None and item_id is not None:
                 encoded, is_new = session_cache.get_or_encode(
                     item_id, meta_key,
-                    lambda fp=file_path, it=item_type: _encode_single_mm_item(it, fp),
+                    (lambda media=item['media']: _encode_shared_audio(media)) if item.get('media') is not None
+                    else (lambda fp=file_path, it=item_type: _encode_single_mm_item(it, fp)),
                 )
             else:
-                encoded = _encode_single_mm_item(item_type, file_path)
+                encoded = _encode_shared_audio(item['media']) if item.get('media') is not None else _encode_single_mm_item(item_type, file_path)
 
             if encoded is None:
                 _logger.warning(
@@ -781,6 +844,10 @@ def create_socketio_app(model, processor):
 
     _active = {}   # sid -> (asyncio.Task, request_id: str)
     _session_caches: Dict[str, MmItemCache] = {}  # sid -> per-session encoding cache
+    # A control connection owns the lifetime; generation sockets merely attach.
+    _contexts = {}  # (manager process, interaction) -> (control sid, cache)
+    _retired_contexts = set()
+    _active_contexts = {}  # generation sid -> (namespace, request_id)
 
     # Socket.IO handlers may overlap even on one connection.
     _session_locks = {}
@@ -808,7 +875,55 @@ def create_socketio_app(model, processor):
             _logger.warning(f"model.abort({req_id}) failed ({reason}): {exc}")
             return {'ok': False, 'request_id': req_id, 'error': str(exc)}
         _active.pop(sid, None)
+        _active_contexts.pop(sid, None)
         return {'ok': True, 'request_id': req_id, 'status': 'stopped'}
+
+    def context_key(data):
+        if not isinstance(data, dict):
+            raise ValueError('Context identity must be an object')
+        key = data.get('process_id'), data.get('interaction_id')
+        if any(not isinstance(value, str) or not value or len(value) > 128 for value in key):
+            raise ValueError('Context process_id and interaction_id are required')
+        return key
+
+    async def retire_context(key):
+        entry = _contexts.pop(key, None)
+        _retired_contexts.add(key)
+        if entry is not None:
+            entry[1].retire()
+        for target, (namespace, rid) in list(_active_contexts.items()):
+            lock = _session_locks.get(target)
+            if namespace == key and lock is not None:
+                async with lock:
+                    if _active_contexts.get(target) == (key, rid):
+                        await _abort_active(target, 'context retired', request_id=rid)
+
+    @sio.on('register_context')
+    async def on_register_context(sid, payload):
+        try:
+            if sid not in _session_caches:
+                raise ValueError('Disconnected')
+            key = context_key(payload)
+            if key in _retired_contexts:
+                raise ValueError('Context namespace has been retired')
+            if key in _contexts and _contexts[key][0] != sid:
+                raise ValueError('Context namespace already has an owner')
+            if key not in _contexts:
+                _contexts[key] = (sid, MmItemCache())
+            return {'ok': True, 'process_id': key[0], 'interaction_id': key[1]}
+        except ValueError as exc:
+            return {'ok': False, 'error': str(exc)}
+
+    @sio.on('retire_context')
+    async def on_retire_context(sid, payload):
+        try:
+            key = context_key(payload)
+            if key not in _contexts or _contexts[key][0] != sid:
+                raise ValueError('Only the context owner may retire its namespace')
+            await retire_context(key)
+            return {'ok': True}
+        except ValueError as exc:
+            return {'ok': False, 'error': str(exc)}
 
     @sio.on("connect")
     async def on_connect(sid, environ):
@@ -829,7 +944,10 @@ def create_socketio_app(model, processor):
                 _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
             await _abort_active(sid, "disconnect")
             _active.pop(sid, None)
-            _session_locks.pop(sid, None)
+        for key, entry in list(_contexts.items()):
+            if entry[0] == sid:
+                await retire_context(key)
+        _session_locks.pop(sid, None)
 
     @sio.on("generate")
     async def on_generate(sid, payload):
@@ -847,11 +965,25 @@ def create_socketio_app(model, processor):
                 }, to=sid)
                 return
             payload['request_id'] = request_id
+            cache = _session_caches.get(sid)
+            if payload.get('context') is not None:
+                try:
+                    if payload.get('protocol_version') != 1:
+                        raise ValueError('Unsupported shared context protocol')
+                    key = context_key(payload['context'])
+                    if key not in _contexts:
+                        raise ValueError('Unknown or retired context namespace; owner must register first')
+                    cache = _contexts[key][1]
+                    _active_contexts[sid] = (key, request_id)
+                except ValueError as exc:
+                    await sio.emit('generation_error', {'request_id': request_id, 'error': str(exc)}, to=sid)
+                    return {'ok': False, 'error': str(exc)}
             task = asyncio.create_task(
                 _stream_generate(sio, sid, model, processor, payload,
-                                 session_cache=_session_caches.get(sid))
+                                 session_cache=cache)
             )
             _active[sid] = (task, request_id)
+            return {'ok': True, 'request_id': request_id}
 
     @sio.on("stop")
     async def on_stop(sid, payload=None):

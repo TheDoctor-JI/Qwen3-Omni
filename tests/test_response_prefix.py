@@ -86,7 +86,7 @@ class Model:
 
 @pytest.mark.parametrize('prefix', ['<plan>', '[reason]'])
 def test_stream_echoes_once_and_existing_parser_extracts_reason(server, prefix):
-    from AudioLLMInterface.utils.in_response_cot import InResponseReasonParser
+    from mm_llm_interface.parsing.in_response_cot import InResponseReasonParser
     closing = '</plan>' if prefix == '<plan>' else '[/reason]'
     continuation = ['Assess', 'Assess the context' + closing[:3], 'Assess the context' + closing + 'Hello']
     ns, processor = server

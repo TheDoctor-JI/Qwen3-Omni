@@ -11,7 +11,7 @@ conda activate qwen3omni-vllm015
 
 # Launch the Socket.IO server
 cd "$(dirname "${BASH_SOURCE[0]}")"
-CONFIG_PATH="../AudioLLMInterface/MultiModalLLM/mm_llm_config.yaml"
+CONFIG_PATH="${MM_LLM_CONFIG:-../mm_llm_interface/config.yaml}"
 # The launcher writes model.checkpoint (thinking or instruct) into the YAML.
 exec python ../runtime_launch.py --config "$CONFIG_PATH" --section model --production-qwen --append-port --append-checkpoint -- python socketio_server.py \
     --config "$CONFIG_PATH" \
