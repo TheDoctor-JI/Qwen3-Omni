@@ -23,6 +23,16 @@ identity in their requests. Their disconnect does not clear shared entries.
 Owner retirement/disconnect retires the cache and aborts attached generations;
 it does not affect another namespace. Retired identities cannot be reused.
 
+An owner can also call `warm_up {process_id, interaction_id, timeout?: 180}`.
+It runs a synthetic text-only request and a synthetic 0.5-second tone-plus-text
+request through the normal inference path, with thinking disabled and 16 output
+tokens per pass. Outputs are discarded through an internal sink, not emitted as
+generation events or added to context/application media caches. Success returns
+`{ok: true, passes: ["text", "audio_text"]}`; preprocessing/model errors, cancellation
+or timeout fail the acknowledgment. Timeout must be positive and at most 600
+seconds. Only one warm-up per owner socket may be in flight. Owner disconnect
+cancels warm-up and aborts unfinished engine requests.
+
 ## Generation payload
 
 ```json

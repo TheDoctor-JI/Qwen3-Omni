@@ -833,6 +833,44 @@ async def _stream_generate(sio, sid, model, processor, payload,
 # Socket.IO application factory
 # ---------------------------------------------------------------------------
 
+def _warmup_payloads():
+    """Synthetic fixtures only: no dialogue items, shared media or client cache."""
+    import io
+    import math
+    import struct
+    import wave
+    output = io.BytesIO()
+    with wave.open(output, 'wb') as wav:
+        wav.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+        wav.writeframes(b''.join(struct.pack('<h', int(1000 * math.sin(2*math.pi*220*i/16000)))
+                                 for i in range(8000)))
+    text = {'type':'text', 'text':'Synthetic startup test. Reply with READY.'}
+    audio = {'type':'audio', 'data':base64.b64encode(output.getvalue()).decode(), 'suffix':'.wav'}
+    return [dict(messages=[dict(role='user', content=content)],
+                 params=dict(thinking_mode=False, max_tokens=16, temperature=0),
+                 request_id='warmup-' + uuid.uuid4().hex) for content in ([text], [audio, text])]
+
+
+async def _run_warmup(model, processor):
+    class DiscardOutput:
+        def __init__(self):
+            self.complete = False
+            self.error = None
+        async def emit(self, name, data, **kwargs):
+            if name == 'generation_complete': self.complete = True
+            if name == 'generation_error': self.error = data['error']
+    for payload in _warmup_payloads():
+        sink = DiscardOutput()
+        try:
+            await _stream_generate(sink, 'warmup', model, processor, payload, session_cache=None)
+            if not sink.complete:
+                raise RuntimeError(sink.error or 'Warm-up did not complete')
+        finally:
+            if not sink.complete:
+                await model.abort(payload['request_id'])
+    return {'ok': True, 'passes': ['text', 'audio_text']}
+
+
 def create_socketio_app(model, processor):
     sio = socketio.AsyncServer(
         async_mode="aiohttp",
@@ -848,6 +886,7 @@ def create_socketio_app(model, processor):
     _contexts = {}  # (manager process, interaction) -> (control sid, cache)
     _retired_contexts = set()
     _active_contexts = {}  # generation sid -> (namespace, request_id)
+    _warmups = {}
 
     # Socket.IO handlers may overlap even on one connection.
     _session_locks = {}
@@ -925,6 +964,33 @@ def create_socketio_app(model, processor):
         except ValueError as exc:
             return {'ok': False, 'error': str(exc)}
 
+    @sio.on('warm_up')
+    async def on_warm_up(sid, payload):
+        task = None
+        try:
+            key = context_key(payload)
+            if key not in _contexts or _contexts[key][0] != sid:
+                raise ValueError('Warm-up requires a registered context owner')
+            if sid in _warmups:
+                raise ValueError('Warm-up already running')
+            timeout = float(payload.get('timeout', 180))
+            if not 0 < timeout <= 600:
+                raise ValueError('Warm-up timeout must be in (0, 600] seconds')
+            task = asyncio.create_task(_run_warmup(model, processor))
+            _warmups[sid] = task
+            result = await asyncio.wait_for(task, timeout=timeout)
+            if key not in _contexts or _contexts[key][0] != sid:
+                raise ValueError('Context ended during warm-up')
+            return result
+        except asyncio.CancelledError:
+            return {'ok': False, 'error': 'Warm-up cancelled'}
+        except Exception as exc:
+            _logger.exception('Warm-up failed')
+            return {'ok': False, 'error': str(exc)}
+        finally:
+            if task is not None and _warmups.get(sid) is task:
+                _warmups.pop(sid, None)
+
     @sio.on("connect")
     async def on_connect(sid, environ):
         _logger.info(f"connect    sid={sid}")
@@ -934,6 +1000,13 @@ def create_socketio_app(model, processor):
 
     @sio.on("disconnect")
     async def on_disconnect(sid):
+        warmup = _warmups.get(sid)
+        if warmup is not None:
+            warmup.cancel()
+            try:
+                await warmup
+            except (asyncio.CancelledError, Exception):
+                pass
         lock = _session_locks.get(sid)
         if lock is None:
             return
