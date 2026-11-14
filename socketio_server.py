@@ -105,7 +105,7 @@ from qwen_omni_utils import process_mm_info
 from transformers import Qwen3OmniMoeProcessor
 
 
-DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
+DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Instruct"
 
 # Set during _load_model_processor; guards how many *new* (uncached) mm items
 # a single request may introduce.
