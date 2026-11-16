@@ -22,7 +22,7 @@ Socket.IO protocol
   Client → Server events:
     "generate"  { messages: [{role, content: [{type, ...}]}],
                   params:{temperature,top_p,top_k,
-                  max_tokens,thinking_mode,response_prefix?},
+                  max_tokens,thinking_mode,response_prefix?,in_response_cot?},
                   request_id? }   — request_id is optional; server generates one if absent
     "stop"      { request_id? }  — cancel the running generation
 
@@ -32,6 +32,10 @@ Socket.IO protocol
   detection relies on "instruct" in the loaded checkpoint path (case-insensitive);
   local directory aliases must retain that marker. Prefixes do not count toward
   model-generated tokens. The server assigns no semantics to the prefix.
+
+  params.in_response_cot optionally enables one EOS repair/continuation for a
+  leading plan: {enabled:true, open_tag:"<plan>", close_tag:"</plan>"}.
+  Without explicit opt-in, generation behaviour is unchanged.
 
   Server → Client events:
     "server_ready"         { sid }
@@ -642,6 +646,93 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
 # Core streaming generation coroutine
 # ---------------------------------------------------------------------------
 
+def _inline_plan_contract(params):
+    contract = params.get('in_response_cot')
+    if contract is None:
+        return None
+    if not isinstance(contract, dict) or type(contract.get('enabled')) is not bool:
+        raise ValueError('in_response_cot requires a boolean enabled field')
+    if not contract['enabled']:
+        return None
+    opening, closing = contract.get('open_tag'), contract.get('close_tag')
+    if (not isinstance(opening, str) or not opening.strip()
+            or not isinstance(closing, str) or not closing.strip()
+            or opening in closing or closing in opening):
+        raise ValueError('Invalid in_response_cot planning delimiters')
+    if (params.get('thinking_mode', True) or params.get('prime_thinking', False)
+            or params.get('thinking_prefix', '')):
+        raise ValueError('in_response_cot requires native thinking and priming disabled')
+    prefix = params.get('response_prefix', '')
+    if not isinstance(prefix, str) or not prefix.startswith(opening):
+        raise ValueError('in_response_cot requires a prefill starting with its opening tag')
+    if not _inline_plan_pending(prefix, (opening, closing)):
+        raise ValueError('in_response_cot prefill must leave the planning block open')
+    return opening, closing
+
+
+def _inline_plan_pending(text, contract):
+    opening, closing = contract
+    if not text.startswith(opening):
+        raise ValueError('Missing leading inline planning block')
+    body = text[len(opening):]
+    end, nested = body.find(closing), body.find(opening)
+    if nested >= 0 and (end < 0 or nested < end):
+        raise ValueError('Nested inline planning block')
+    return end < 0
+
+
+async def _generate_inline_plan(model, processor, inputs, sampling_params,
+                                request_id, contract, prefix, engine_requests, key):
+    """At most two engine attempts, exposed as one cumulative response stream."""
+    import copy
+    from types import SimpleNamespace
+
+    original_prompt = inputs['prompt']
+    budget = sampling_params.max_tokens
+    base_text, prior_ids = '', ()
+    attempt_inputs, attempt_params = inputs, sampling_params
+    for attempt in range(2):
+        engine_id = request_id if attempt == 0 else request_id + ':plan-continuation'
+        engine_requests[key] = engine_id
+        saw_output = terminal = recover = False
+        async for output in model.generate(attempt_inputs, attempt_params, engine_id):
+            if terminal:
+                raise RuntimeError('Engine produced output after terminal inline-planning result')
+            saw_output = True
+            item = output.outputs[0]
+            generated = base_text + item.text
+            token_ids = prior_ids + tuple(item.token_ids)
+            terminal = output.finished
+            if terminal and _inline_plan_pending(prefix + generated, contract):
+                # vLLM reports ordinary EOS as finish_reason='stop', stop_reason=None;
+                # explicit stop strings/tokens carry their reason. Never repair length.
+                reason = getattr(item, 'stop_reason', None)
+                eos = getattr(getattr(processor, 'tokenizer', None), 'eos_token_id', None)
+                eos_ids = set(eos if isinstance(eos, (list, tuple, set)) else [eos]) - {None}
+                normal_eos = (getattr(item, 'finish_reason', None) == 'stop'
+                              and (reason is None or reason == '<|im_end|>' or reason in eos_ids))
+                if attempt or not normal_eos or len(token_ids) >= budget:
+                    raise RuntimeError('Inline plan ended unclosed without an eligible EOS continuation')
+                recover = True
+                _logger.info('[%s] Repairing unclosed inline plan at EOS: finish=%r stop=%r tokens=%s; injecting %r',
+                             request_id, item.finish_reason, reason, len(token_ids), contract[1])
+            yield SimpleNamespace(
+                outputs=[SimpleNamespace(text=generated, token_ids=token_ids)],
+                finished=terminal and not recover,
+            )
+        if not saw_output or not terminal:
+            raise RuntimeError('Inline planning engine attempt ended without a terminal output')
+        if not recover:
+            return
+        base_text, prior_ids = generated + contract[1], token_ids
+        # Publish the inserted close before continuing, without a terminal flag.
+        yield SimpleNamespace(outputs=[SimpleNamespace(text=base_text, token_ids=prior_ids)],
+                              finished=False, injected=True)
+        attempt_inputs = dict(inputs, prompt=original_prompt + base_text)
+        attempt_params = copy.copy(sampling_params)
+        attempt_params.max_tokens = budget - len(prior_ids)
+
+
 async def _stream_generate(sio, sid, model, processor, payload,
                            session_cache: Optional[MmItemCache] = None):
 
@@ -664,8 +755,11 @@ async def _stream_generate(sio, sid, model, processor, payload,
     _think_ended   = False
 
     temp_files = []
+    plan_contract = None
+    cancelled = False
     try:
         response_prefix = _response_prefix(p)
+        plan_contract = _inline_plan_contract(p)
         previous_model_text = ""
         saw_output = False
         # Offload blocking preprocessing (base64 decode, tokenization,
@@ -709,7 +803,15 @@ async def _stream_generate(sio, sid, model, processor, payload,
         await sio.emit("generation_start", {"request_id": request_id}, to=sid)
 
         t_start = time.perf_counter()
-        async for output in model.generate(inputs, sampling_params, request_id):
+        if plan_contract:
+            if not hasattr(sio, '_qwen_engine_requests'):
+                sio._qwen_engine_requests = {}
+            generation = _generate_inline_plan(
+                model, processor, inputs, sampling_params, request_id, plan_contract,
+                response_prefix, sio._qwen_engine_requests, (sid, request_id))
+        else:
+            generation = model.generate(inputs, sampling_params, request_id)
+        async for output in generation:
             saw_output = True
             model_text = output.outputs[0].text
             last_token_ids = getattr(output.outputs[0], 'token_ids', ())
@@ -722,7 +824,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
             delta = full_text[len(prev_text):]
             if delta:
                 elapsed = time.perf_counter() - t_start
-                if model_text != previous_model_text:
+                if model_text != previous_model_text and not getattr(output, 'injected', False):
                     if ttft is None:
                         ttft = elapsed
                         _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
@@ -765,6 +867,9 @@ async def _stream_generate(sio, sid, model, processor, payload,
                         "time_to_first_token": round(ttft, 3) if ttft is not None else None,
                     })
 
+                if plan_contract:
+                    # A stop during emit must report all text already exposed.
+                    prev_text = full_text
                 await sio.emit("token", token_payload, to=sid)
                 prev_text = full_text
             previous_model_text = model_text
@@ -800,6 +905,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
         }, to=sid)
 
     except asyncio.CancelledError:
+        cancelled = True
         _logger.info(f"[{request_id}] Generation cancelled (stopped by client)")
         total_time = time.perf_counter() - t_start
         tps = n_tokens / total_time if total_time > 0 else 0.0
@@ -824,6 +930,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
         }, to=sid)
 
     finally:
+        if plan_contract and not cancelled and hasattr(sio, '_qwen_engine_requests'):
+            sio._qwen_engine_requests.pop((sid, request_id), None)
         for path in temp_files:
             try:
                 os.unlink(path)
@@ -872,7 +980,9 @@ def create_socketio_app(model, processor, metadata=None):
                 _logger.exception(f"Generation task failed during {reason}: {req_id}")
         _cancelling.add(sid)
         try:
-            await asyncio.wait_for(model.abort(req_id), timeout=5)
+            engine_requests = getattr(sio, '_qwen_engine_requests', {})
+            engine_id = engine_requests.get((sid, req_id), req_id)
+            await asyncio.wait_for(model.abort(engine_id), timeout=5)
         except Exception as exc:
             # Keep the entry so subsequent requests cannot bypass a failed abort.
             _logger.warning(f"model.abort({req_id}) failed ({reason}): {exc}")
@@ -881,6 +991,7 @@ def create_socketio_app(model, processor, metadata=None):
         finally:
             _cancelling.discard(sid)
         _active.pop(sid, None)
+        engine_requests.pop((sid, req_id), None)
         return {'ok': True, 'request_id': req_id, 'status': 'stopped'}
 
     @sio.on("connect")
