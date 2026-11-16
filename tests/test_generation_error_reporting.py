@@ -121,7 +121,7 @@ def load_app(model, stream):
     socket = FakeSocket()
     ns.update(socketio=SimpleNamespace(AsyncServer=lambda **kwargs: socket),
               web=SimpleNamespace(Application=lambda: SimpleNamespace(
-                  router=SimpleNamespace(add_get=lambda *args: None))),
+                  router=SimpleNamespace(add_get=lambda *args: None), on_shutdown=[])),
               _stream_generate=stream)
     node = next(n for n in ast.parse(SERVER.read_text()).body
                 if isinstance(n, ast.FunctionDef) and n.name == 'create_socketio_app')
@@ -219,6 +219,8 @@ def test_socket_ack_waits_for_server_cancellation_cleanup():
         started, cleanup_started, finish_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
         aborted = []
         class Engine:
+            def shutdown(self):
+                pass
             async def abort(self, rid):
                 aborted.append(rid)
         async def stream(*args, **kwargs):

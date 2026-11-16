@@ -1,5 +1,20 @@
 # Qwen3-Omni
 
+## Standalone hosting in SocialTaskImplementation
+
+Use `./start_standalone_server.sh --checkpoint thinking` (or `instruct`) to host
+Qwen independently of deployment sessions, and `./stop_standalone_server.sh` to
+stop it. Both system launchers expose the same Start Qwen3 / Stop Qwen3 controls.
+Normal Stop Session / functional-port cleanup leaves the model alive. Existing
+GPU 2 / PCI bus ordering and model tuning remain in effect.
+
+The Socket.IO server exposes read-only `GET /status` with actual loaded checkpoint,
+instance identity, engine health, GPU settings, and connection/cache/work counts.
+`server_ready` includes identity alongside `sid`. Per-connection caches are
+released on disconnect; engagement/disengagement retains connections as before.
+Foreground diagnostic scripts remain available. In the integrated checkout,
+see [the service guide](../qwen_service/README.md) for lifecycle, logs, and recovery.
+
 <br>
 
 <p align="center">

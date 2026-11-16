@@ -263,8 +263,12 @@ def _save_temp_b64(data_b64, suffix):
     """Decode a base64 blob and write it to a temp file; return its path."""
     raw = base64.b64decode(data_b64)
     fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, 'wb') as fh:
-        fh.write(raw)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(raw)
+    except BaseException:
+        os.unlink(path)
+        raise
     return path
 
 
@@ -285,54 +289,63 @@ def _build_messages(payload):
 
     default_suffixes = {"audio": ".wav", "image": ".jpg", "video": ".mp4"}
 
-    for msg in payload.get("messages") or []:
-        role = msg.get("role", "user")
-        raw_content = msg.get("content")
+    try:
+        for msg in payload.get("messages") or []:
+            role = msg.get("role", "user")
+            raw_content = msg.get("content")
 
-        # Normalise content to list-of-dicts
-        if isinstance(raw_content, str):
-            raw_content = [{"type": "text", "text": raw_content}]
-        if not isinstance(raw_content, list):
-            continue
+            # Normalise content to list-of-dicts
+            if isinstance(raw_content, str):
+                raw_content = [{"type": "text", "text": raw_content}]
+            if not isinstance(raw_content, list):
+                continue
 
-        out_content = []
-        for item in raw_content:
-            item_type = item.get("type", "text")
+            out_content = []
+            for item in raw_content:
+                item_type = item.get("type", "text")
 
-            if item_type in default_suffixes and item.get("data"):
-                # Inline base64 media — materialise to temp file
-                suffix = item.get("suffix") or default_suffixes[item_type]
-                path = _save_temp_b64(item["data"], suffix)
-                temp_files.append(path)
-                out_item = {"type": item_type, item_type: path}
-                # Copy through cache annotation fields if present
-                for ann_key in ('item_id', 'duration_ms', 'sample_rate'):
-                    if ann_key in item:
-                        out_item[ann_key] = item[ann_key]
-                out_content.append(out_item)
+                if item_type in default_suffixes and item.get("data"):
+                    # Inline base64 media — materialise to temp file
+                    suffix = item.get("suffix") or default_suffixes[item_type]
+                    path = _save_temp_b64(item["data"], suffix)
+                    temp_files.append(path)
+                    out_item = {"type": item_type, item_type: path}
+                    # Copy through cache annotation fields if present
+                    for ann_key in ('item_id', 'duration_ms', 'sample_rate'):
+                        if ann_key in item:
+                            out_item[ann_key] = item[ann_key]
+                    out_content.append(out_item)
 
-            elif item_type == "audio" and item.get("item_id") and not item.get("data"):
-                # Stub reference — client believes this item is already cached.
-                # Pass through annotation fields only; no temp file created.
-                out_item = {"type": "audio", "item_id": item["item_id"]}
-                for ann_key in ('duration_ms', 'sample_rate'):
-                    if ann_key in item:
-                        out_item[ann_key] = item[ann_key]
-                out_content.append(out_item)
+                elif item_type == "audio" and item.get("item_id") and not item.get("data"):
+                    # Stub reference — client believes this item is already cached.
+                    # Pass through annotation fields only; no temp file created.
+                    out_item = {"type": "audio", "item_id": item["item_id"]}
+                    for ann_key in ('duration_ms', 'sample_rate'):
+                        if ann_key in item:
+                            out_item[ann_key] = item[ann_key]
+                    out_content.append(out_item)
 
-            elif item_type in default_suffixes and item.get(item_type):
-                # Already a file path (e.g. local testing) — pass through
-                out_content.append(item)
+                elif item_type in default_suffixes and item.get(item_type):
+                    # Already a file path (e.g. local testing) — pass through
+                    out_content.append(item)
 
-            elif item_type == "text":
-                out_content.append({"type": "text", "text": item.get("text", "")})
+                elif item_type == "text":
+                    out_content.append({"type": "text", "text": item.get("text", "")})
 
-            else:
-                # Unknown item type — pass through
-                out_content.append(item)
+                else:
+                    # Unknown item type — pass through
+                    out_content.append(item)
 
-        if out_content:
-            messages.append({"role": role, "content": out_content})
+            if out_content:
+                messages.append({"role": role, "content": out_content})
+
+    except BaseException:
+        for path in temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
 
     return messages, temp_files
 
@@ -526,74 +539,85 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     response_prefix = _response_prefix(p)
 
     messages, temp_files = _build_messages(payload)
-    _logger.info(
-        f"[{request_id}] _build_messages parsed {len(messages)} messages, "
-        f"{len(temp_files)} temp files"
-    )
-
-    audios, images, videos, n_new, confirmed = _process_mm_info_cached(
-        messages, session_cache, request_id,
-    )
-    _logger.info(
-        f"[{request_id}] _process_mm_info_cached: "
-        f"audios={len(audios) if audios else 0}, "
-        f"images={len(images) if images else 0}, "
-        f"videos={len(videos) if videos else 0}, "
-        f"n_new={n_new}, confirmed={len(confirmed)}"
-    )
-    if n_new > _MAX_NEW_MM_PER_REQUEST:
-        raise ValueError(
-            f"Too many new multimodal items to encode in a single request: "
-            f"{n_new} > limit {_MAX_NEW_MM_PER_REQUEST}. "
-            f"Consider reducing context window size."
+    try:
+        _logger.info(
+            f"[{request_id}] _build_messages parsed {len(messages)} messages, "
+            f"{len(temp_files)} temp files"
         )
 
-    # Match the official Instruct recipe: omit enable_thinking so its template
-    # does not insert an empty native <think> block before the assistant output.
-    template_options = {} if _MODEL_IS_INSTRUCT else {'enable_thinking': thinking_mode}
-    prompt_text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, **template_options,
-    )
-
-    thinking_prefix = p.get('thinking_prefix', '') or ''
-    if thinking_prefix:
-        prompt_text += thinking_prefix
-        _logger.debug(
-            f"[{request_id}] Appended thinking_prefix "
-            f"({len(thinking_prefix)} chars) to prompt"
+        audios, images, videos, n_new, confirmed = _process_mm_info_cached(
+            messages, session_cache, request_id,
         )
+        _logger.info(
+            f"[{request_id}] _process_mm_info_cached: "
+            f"audios={len(audios) if audios else 0}, "
+            f"images={len(images) if images else 0}, "
+            f"videos={len(videos) if videos else 0}, "
+            f"n_new={n_new}, confirmed={len(confirmed)}"
+        )
+        if n_new > _MAX_NEW_MM_PER_REQUEST:
+            raise ValueError(
+                f"Too many new multimodal items to encode in a single request: "
+                f"{n_new} > limit {_MAX_NEW_MM_PER_REQUEST}. "
+                f"Consider reducing context window size."
+            )
+
+        # Match the official Instruct recipe: omit enable_thinking so its template
+        # does not insert an empty native <think> block before the assistant output.
+        template_options = {} if _MODEL_IS_INSTRUCT else {'enable_thinking': thinking_mode}
+        prompt_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **template_options,
+        )
+
+        thinking_prefix = p.get('thinking_prefix', '') or ''
+        if thinking_prefix:
+            prompt_text += thinking_prefix
+            _logger.debug(
+                f"[{request_id}] Appended thinking_prefix "
+                f"({len(thinking_prefix)} chars) to prompt"
+            )
         
-    if thinking_mode and prime_thinking:
-        open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
-        prompt_text += open_tag + "\n"
-        _logger.debug(f"[{request_id}] Primed prompt with {open_tag}\\n")
+        if thinking_mode and prime_thinking:
+            open_tag = SERVER_CONFIG.get('thinking', {}).get('open_tag', '<think>')
+            prompt_text += open_tag + "\n"
+            _logger.debug(f"[{request_id}] Primed prompt with {open_tag}\\n")
 
-    if response_prefix:
-        prompt_text += response_prefix
-        _logger.debug("[%s] Prefilled response_prefix: %r", request_id, response_prefix)
+        if response_prefix:
+            prompt_text += response_prefix
+            _logger.debug("[%s] Prefilled response_prefix: %r", request_id, response_prefix)
 
-    _logger.debug(
-        f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
-    )
+        _logger.debug(
+            f"[{request_id}] Final prompt ({len(prompt_text)} chars):\n{prompt_text}"
+        )
 
-    sampling_params = SamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        max_tokens=max_tokens,
-        stop=["<|im_end|>", "<|im_start|>"],
-    )
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            stop=["<|im_end|>", "<|im_start|>"],
+        )
 
-    inputs = {
-        "prompt": prompt_text,
-        "multi_modal_data": {},
-        "mm_processor_kwargs": {"use_audio_in_video": True},
-    }
-    if images is not None: inputs["multi_modal_data"]["image"] = images
-    if videos is not None: inputs["multi_modal_data"]["video"] = videos
-    if audios is not None: inputs["multi_modal_data"]["audio"] = audios
+        inputs = {
+            "prompt": prompt_text,
+            "multi_modal_data": {},
+            "mm_processor_kwargs": {"use_audio_in_video": True},
+        }
+        if images is not None: inputs["multi_modal_data"]["image"] = images
+        if videos is not None: inputs["multi_modal_data"]["video"] = videos
+        if audios is not None: inputs["multi_modal_data"]["audio"] = audios
 
-    return inputs, sampling_params, temp_files, confirmed
+        return inputs, sampling_params, temp_files, confirmed
+    except BaseException:
+        # Successful preparation transfers file ownership to the stream (or
+        # its abandoned-thread callback); failed preparation owns its cleanup.
+        for path in temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+
 
 
 # ---------------------------------------------------------------------------
@@ -629,9 +653,32 @@ async def _stream_generate(sio, sid, model, processor, payload,
         # Offload blocking preprocessing (base64 decode, tokenization,
         # audio/image feature extraction) to a worker thread so the event
         # loop stays responsive for new connections and other events.
-        inputs, sampling_params, temp_files, confirmed_items = await asyncio.to_thread(
-            _prepare_inputs, processor, payload, session_cache,
-        )
+        preparation = asyncio.create_task(asyncio.to_thread(
+            _prepare_inputs, processor, payload, session_cache))
+        pending = getattr(sio, '_qwen_preprocessing', set())
+        pending.add(preparation)
+        abandoned = False
+        def preparation_done(job):
+            pending.discard(job)
+            # Cancellation cannot stop a running thread. Consume its result and
+            # clean any returned files, without ever submitting it to the engine.
+            if abandoned and not job.cancelled():
+                try:
+                    for path in job.result()[2]:
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                except Exception:
+                    _logger.debug('Abandoned preprocessing failed', exc_info=True)
+        preparation.add_done_callback(preparation_done)
+        try:
+            inputs, sampling_params, temp_files, confirmed_items = await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            abandoned = True
+            if preparation.done():
+                preparation_done(preparation)
+            raise
 
         # Notify client which items are confirmed in the encoding cache.
         # Emitted before generation_start so the client has acks before tokens.
@@ -770,7 +817,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
 # Socket.IO application factory
 # ---------------------------------------------------------------------------
 
-def create_socketio_app(model, processor):
+def create_socketio_app(model, processor, metadata=None):
     sio = socketio.AsyncServer(
         async_mode="aiohttp",
         cors_allowed_origins="*",
@@ -778,12 +825,16 @@ def create_socketio_app(model, processor):
     )
     app = web.Application()
     sio.attach(app)
+    sio._qwen_preprocessing = set()
+    metadata = dict(metadata or {})
+    lifecycle = {'draining': False, 'cleanup_error': None}
 
     _active = {}   # sid -> (asyncio.Task, request_id: str)
     _session_caches: Dict[str, MmItemCache] = {}  # sid -> per-session encoding cache
 
     # Socket.IO handlers may overlap even on one connection.
     _session_locks = {}
+    _cancelling = set()
 
     async def _abort_active(sid, reason: str, request_id=None):
         """Called under the session lock; acknowledge only after shutdown."""
@@ -801,21 +852,27 @@ def create_socketio_app(model, processor):
                 pass
             except Exception:
                 _logger.exception(f"Generation task failed during {reason}: {req_id}")
+        _cancelling.add(sid)
         try:
-            await model.abort(req_id)
+            await asyncio.wait_for(model.abort(req_id), timeout=5)
         except Exception as exc:
             # Keep the entry so subsequent requests cannot bypass a failed abort.
             _logger.warning(f"model.abort({req_id}) failed ({reason}): {exc}")
+            lifecycle['cleanup_error'] = f'Cancellation failed for {req_id}: {exc}'
             return {'ok': False, 'request_id': req_id, 'error': str(exc)}
+        finally:
+            _cancelling.discard(sid)
         _active.pop(sid, None)
         return {'ok': True, 'request_id': req_id, 'status': 'stopped'}
 
     @sio.on("connect")
     async def on_connect(sid, environ):
+        if lifecycle['draining'] or lifecycle['cleanup_error']:
+            return False
         _logger.info(f"connect    sid={sid}")
         _session_locks[sid] = asyncio.Lock()
         _session_caches[sid] = MmItemCache()
-        await sio.emit("server_ready", {"sid": sid}, to=sid)
+        await sio.emit("server_ready", {**metadata, "sid": sid}, to=sid)
 
     @sio.on("disconnect")
     async def on_disconnect(sid):
@@ -828,7 +885,6 @@ def create_socketio_app(model, processor):
             if cache is not None:
                 _logger.info(f"disconnect sid={sid}: released encoding cache ({len(cache)} entries)")
             await _abort_active(sid, "disconnect")
-            _active.pop(sid, None)
             _session_locks.pop(sid, None)
 
     @sio.on("generate")
@@ -867,7 +923,38 @@ def create_socketio_app(model, processor):
     async def handle_index(request):
         return web.Response(text=_GUI_HTML, content_type="text/html")
 
+    async def handle_status(request):
+        error = lifecycle['cleanup_error']
+        try:
+            await asyncio.wait_for(model.check_health(), timeout=2)
+        except Exception as exc:
+            error = error or str(exc)
+        healthy = error is None
+        ready = healthy and not lifecycle['draining']
+        return web.json_response({**metadata, 'ready': ready, 'engine_healthy': healthy,
+            'draining': lifecycle['draining'], 'error': error,
+            'connected_clients': len(_session_caches),
+            'active_generations': sum(not task.done() or sid in _cancelling
+                                      for sid, (task, _) in _active.items()),
+            'pending_preprocessing': len(sio._qwen_preprocessing),
+            'session_cache_entries': sum(len(cache) for cache in _session_caches.values())},
+            status=200 if ready else 503)
+
+    async def shutdown(application):
+        lifecycle['draining'] = True
+        try:
+            for sid in list(_active):
+                await asyncio.wait_for(_abort_active(sid, 'service shutdown'), timeout=5)
+            if sio._qwen_preprocessing:
+                await asyncio.wait_for(asyncio.gather(*sio._qwen_preprocessing, return_exceptions=True), timeout=20)
+        finally:
+            _session_caches.clear()
+            _session_locks.clear()
+            model.shutdown()
+
     app.router.add_get("/", handle_index)
+    app.router.add_get('/status', handle_status)
+    app.on_shutdown.append(shutdown)
     return app
 
 
@@ -2063,6 +2150,11 @@ if __name__ == "__main__":
     _logger.info(f"Loading model from: {args.checkpoint_path}")
     model, processor = _load_model_processor(args)
     _logger.info(f"Model loaded. Serving GUI + Socket.IO on http://{args.host}:{args.port}")
-    app = create_socketio_app(model, processor)
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from qwen_service.config import server_metadata
+    metadata = server_metadata(SERVER_CONFIG, args.checkpoint_path, args.port,
+        os.environ.get('QWEN_SERVICE_INSTANCE_ID') or uuid.uuid4().hex)
+    app = create_socketio_app(model, processor, metadata)
     # Suppress the default "Running on ..." banner from aiohttp
     web.run_app(app, host=args.host, port=args.port, print=lambda _: None)
