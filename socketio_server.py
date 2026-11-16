@@ -188,6 +188,23 @@ def _load_config(config_path):
 # Global config mapping
 SERVER_CONFIG = {}
 
+def _tool_responses_as_system(template):
+    """Render tool feedback as system turns, retaining native response tags.
+
+    Patch only the tool branch of the checkpoint template. Genuine user turns
+    and grouping of consecutive tool responses keep their native formatting.
+    """
+    branch = '{%- elif message.role == "tool" %}'
+    old = "{{- '<|im_start|>user' }}"
+    new = "{{- '<|im_start|>system' }}"
+    if not isinstance(template, str) or template.count(branch) != 1:
+        raise ValueError('Unsupported chat template: expected one tool-role branch')
+    before, tool_branch = template.split(branch, 1)
+    if tool_branch.count(old) != 1:
+        raise ValueError('Unsupported chat template: expected one tool user-turn opener')
+    return before + branch + tool_branch.replace(old, new, 1)
+
+
 def _load_model_processor(args):
     global SERVER_CONFIG
     config = _load_config(getattr(args, 'config', None))
@@ -238,6 +255,7 @@ def _load_model_processor(args):
     )
     model = AsyncLLMEngine.from_engine_args(engine_args)
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
+    processor.chat_template = _tool_responses_as_system(processor.chat_template)
 
     # Override max audio duration from config (default: 300s = 5 min)
     audio_cfg = config.get('audio', {})
