@@ -84,10 +84,14 @@ class Model:
             raise self.end
 
 
-@pytest.mark.parametrize('prefix', ['<plan>', '[reason]'])
-def test_stream_echoes_once_and_existing_parser_extracts_reason(server, prefix):
+@pytest.mark.parametrize('opening,closing,seed', [
+    ('<plan>', '</plan>', ''), ('[reason]', '[/reason]', ''),
+    ('<plan>', '</plan>', 'Let me see. '),
+    ('<think>', '</think>', 'Let me see. '),
+])
+def test_stream_echoes_once_and_existing_parser_extracts_reason(server, opening, closing, seed):
     from AudioLLMInterface.utils.in_response_cot import InResponseReasonParser
-    closing = '</plan>' if prefix == '<plan>' else '[/reason]'
+    prefix = opening + seed
     continuation = ['Assess', 'Assess the context' + closing[:3], 'Assess the context' + closing + 'Hello']
     ns, processor = server
     socket, model = Socket(), Model(continuation)
@@ -95,7 +99,7 @@ def test_stream_echoes_once_and_existing_parser_extracts_reason(server, prefix):
     assert model.inputs['prompt'].endswith(prefix)
     tokens = [data for name, data in socket.events if name == 'token']
     accumulated = ''
-    parser = InResponseReasonParser(True, prefix, closing)
+    parser = InResponseReasonParser(True, opening, closing)
     action = ''
     for token in tokens:
         accumulated += token['delta']
@@ -104,7 +108,7 @@ def test_stream_echoes_once_and_existing_parser_extracts_reason(server, prefix):
     assert accumulated == prefix + continuation[-1]
     assert accumulated.count(prefix) == 1
     assert action + parser.feed('', final=True) == 'Hello'
-    assert parser.reason == 'Assess the context'
+    assert parser.reason == seed + 'Assess the context'
     final = socket.events[-1][1]
     assert final['full_text'] == accumulated
     assert final['generated_tokens'] == tokens[-1]['generated_tokens'] == 3
