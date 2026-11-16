@@ -35,6 +35,9 @@ Socket.IO protocol
 
   params.in_response_cot optionally enables one EOS repair/continuation for a
   leading plan: {enabled:true, open_tag:"<plan>", close_tag:"</plan>"}.
+  Optional action_open_tag/action_close_tag add structural action boundaries:
+  an early action closes the plan, a closed action ends output, and normal EOS
+  closes an open action. Tags are structural even inside quoted text.
   Without explicit opt-in, generation behaviour is unchanged.
 
   Server → Client events:
@@ -667,11 +670,19 @@ def _inline_plan_contract(params):
         raise ValueError('in_response_cot requires a prefill starting with its opening tag')
     if not _inline_plan_pending(prefix, (opening, closing)):
         raise ValueError('in_response_cot prefill must leave the planning block open')
-    return opening, closing
+    action_open, action_close = contract.get('action_open_tag'), contract.get('action_close_tag')
+    if action_open is None and action_close is None:
+        return opening, closing
+    tags = (opening, closing, action_open, action_close)
+    if any(not isinstance(tag, str) or not tag.strip() for tag in tags):
+        raise ValueError('Invalid in_response_cot action delimiters')
+    if any(a in b or b in a for i, a in enumerate(tags) for b in tags[i + 1:]):
+        raise ValueError('Overlapping in_response_cot delimiters')
+    return tags
 
 
 def _inline_plan_pending(text, contract):
-    opening, closing = contract
+    opening, closing = contract[:2]
     if not text.startswith(opening):
         raise ValueError('Missing leading inline planning block')
     body = text[len(opening):]
@@ -679,6 +690,33 @@ def _inline_plan_pending(text, contract):
     if nested >= 0 and (end < 0 or nested < end):
         raise ValueError('Nested inline planning block')
     return end < 0
+
+
+def _normalize_inline_action(text, contract, *, final=False, normal_eos=False):
+    """Structural boundary repair before any corresponding bytes reach the client."""
+    if len(contract) == 2:
+        return text, False
+    opening, closing, action_open, action_close = contract
+    start = text.find(action_open, len(opening))
+    if start >= 0:
+        end_plan = text.find(closing, len(opening))
+        if end_plan < 0 or start < end_plan:
+            text = text[:start] + closing + text[start:]
+            start += len(closing)
+        end_action = text.find(action_close, start + len(action_open))
+        if end_action >= 0:
+            return text[:end_action + len(action_close)], True
+        if final and normal_eos:
+            return text + action_close, True
+        pending_tag = action_close
+    else:
+        pending_tag = action_open
+    if not final:
+        hold = max((size for size in range(1, len(pending_tag))
+                    if text.endswith(pending_tag[:size])), default=0)
+        if hold:
+            text = text[:-hold]
+    return text, False
 
 
 async def _generate_inline_plan(model, processor, inputs, sampling_params,
@@ -703,21 +741,31 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
             generated = base_text + item.text
             token_ids = prior_ids + tuple(item.token_ids)
             terminal = output.finished
-            if terminal and _inline_plan_pending(prefix + generated, contract):
+            reason = getattr(item, 'stop_reason', None)
+            eos = getattr(getattr(processor, 'tokenizer', None), 'eos_token_id', None)
+            eos_ids = set(eos if isinstance(eos, (list, tuple, set)) else [eos]) - {None}
+            normal_eos = (getattr(item, 'finish_reason', None) == 'stop'
+                          and (reason is None or reason == '<|im_end|>' or reason in eos_ids))
+            normalized, action_done = _normalize_inline_action(
+                prefix + generated, contract, final=terminal, normal_eos=normal_eos)
+            if action_done:
+                if not terminal:
+                    await model.abort(engine_id)
+                yield SimpleNamespace(
+                    outputs=[SimpleNamespace(text=normalized[len(prefix):], token_ids=token_ids)],
+                    finished=True,
+                )
+                return
+            if terminal and _inline_plan_pending(normalized, contract):
                 # vLLM reports ordinary EOS as finish_reason='stop', stop_reason=None;
                 # explicit stop strings/tokens carry their reason. Never repair length.
-                reason = getattr(item, 'stop_reason', None)
-                eos = getattr(getattr(processor, 'tokenizer', None), 'eos_token_id', None)
-                eos_ids = set(eos if isinstance(eos, (list, tuple, set)) else [eos]) - {None}
-                normal_eos = (getattr(item, 'finish_reason', None) == 'stop'
-                              and (reason is None or reason == '<|im_end|>' or reason in eos_ids))
                 if attempt or not normal_eos or len(token_ids) >= budget:
                     raise RuntimeError('Inline plan ended unclosed without an eligible EOS continuation')
                 recover = True
                 _logger.info('[%s] Repairing unclosed inline plan at EOS: finish=%r stop=%r tokens=%s; injecting %r',
                              request_id, item.finish_reason, reason, len(token_ids), contract[1])
             yield SimpleNamespace(
-                outputs=[SimpleNamespace(text=generated, token_ids=token_ids)],
+                outputs=[SimpleNamespace(text=normalized[len(prefix):], token_ids=token_ids)],
                 finished=terminal and not recover,
             )
         if not saw_output or not terminal:

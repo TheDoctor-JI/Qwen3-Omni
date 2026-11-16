@@ -157,9 +157,12 @@ def test_empty_or_failed_attempt_has_one_error_and_no_completion(attempts):
 
 @pytest.mark.parametrize('when', ['first', 'between', 'second'])
 @pytest.mark.parametrize('event', ['stop', 'disconnect'])
-def test_cancel_aborts_active_attempt_without_starting_another(when, event):
+@pytest.mark.parametrize('action_contract', [False, True])
+def test_cancel_aborts_active_attempt_without_starting_another(when, event, action_contract):
     async def scenario():
         ns, payload, processor, _, _ = setup()
+        if action_contract:
+            payload['params']['in_response_cot'] = dict(ACTION_CONTRACT)
         entered = asyncio.Event()
 
         class WaitingEngine(Engine):
@@ -217,14 +220,22 @@ def test_temp_files_cleaned_once_after_both_attempts(tmp_path):
 
 
 @pytest.mark.parametrize('opening,closing', [('<think>', '</think>'), ('<plan>', '</plan>')])
-def test_repaired_stream_completes_actual_mm_tool_pipeline(tmp_path, opening, closing):
+@pytest.mark.parametrize('boundary_repair', [False, True])
+def test_repaired_stream_completes_actual_mm_tool_pipeline(tmp_path, opening, closing, boundary_repair):
     from AudioLLMInterface.tests.test_mm_in_response_cot import setup as client_setup
     from AudioLLMInterface.Shared_Components.AudioLLMGenerationTrajectory import GenerationTerminationState
 
     action = '{"name":"set_language","arguments":{"lang":"mandarin"}}'
-    engine = Engine([[output('A finished plan.')], [output('<action>' + action + '</action>')]])
-    socket, _, _, _ = run(engine, opening=opening, closing=closing)
+    if boundary_repair:
+        engine = Engine([[output('A finished plan.<action>' + action + '</action></think>ignored')]])
+        contract = {'enabled': True, 'open_tag': opening, 'close_tag': closing,
+                    'action_open_tag': '<action>', 'action_close_tag': '</action>'}
+        socket, _, _, _ = run(engine, opening=opening, closing=closing, in_response_cot=contract)
+    else:
+        engine = Engine([[output('A finished plan.')], [output('<action>' + action + '</action>')]])
+        socket, _, _, _ = run(engine, opening=opening, closing=closing)
     client, result = client_setup(tmp_path, tools=True)
+    result.gen_config.plan_history_template = 'Latest plan: {plan}'
     client.mm_config['in_response_cot'] = {
         'open_tag': opening, 'close_tag': closing,
         'action_open_tag': '<action>', 'action_close_tag': '</action>',
@@ -245,4 +256,110 @@ def test_repaired_stream_completes_actual_mm_tool_pipeline(tmp_path, opening, cl
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].tool_name == 'set_language'
     assert result.in_response_reason == 'Let me see. A finished plan.'
+    plans = [item for item in client.context_items if item.is_plan]
+    assert len(plans) == 1
+    assert plans[0].text == 'Latest plan: Let me see. A finished plan.'
     client._wait_for_reason_cancellation.assert_not_called()
+
+
+ACTION_CONTRACT = {'enabled': True, 'open_tag': '<think>', 'close_tag': '</think>',
+                   'action_open_tag': '<action>', 'action_close_tag': '</action>'}
+
+
+def assert_action_stream(socket, expected):
+    assert not any(name == 'generation_error' for name, _ in socket.events)
+    accumulated = ''
+    for name, data in socket.events:
+        if name == 'token':
+            accumulated += data['delta']
+            assert accumulated == data['full_text']
+    complete = [data for name, data in socket.events if name == 'generation_complete']
+    assert len(complete) == 1
+    assert accumulated == complete[0]['full_text'] == expected
+
+
+@pytest.mark.parametrize('split', range(1, len('Plan.<action>Hello</action>tail')))
+def test_action_boundary_split_stream_is_monotonic_and_discards_tail(split):
+    raw = 'Plan.<action>Hello</action>tail'
+    engine = Engine([[output(raw[:split], (1,), finish=None), output(raw, (1, 2))]])
+    socket, payload, _, _ = run(engine, in_response_cot=ACTION_CONTRACT)
+    assert_action_stream(socket, payload['params']['response_prefix'] +
+                         'Plan.</think><action>Hello</action>')
+    assert len(engine.calls) == 1
+
+
+def test_action_end_aborts_live_engine_without_consuming_later_output():
+    engine = Engine([[output('Plan.<action>Hello</action>discard', finish=None),
+                      RuntimeError('Must not consume later output')]])
+    socket, payload, _, _ = run(engine, in_response_cot=ACTION_CONTRACT)
+    assert_action_stream(socket, payload['params']['response_prefix'] +
+                         'Plan.</think><action>Hello</action>')
+    assert engine.aborted == ['request']
+
+
+@pytest.mark.parametrize('plan_closed', [False, True])
+@pytest.mark.parametrize('stop', [None, '<|im_end|>', 151645])
+def test_normal_eos_closes_open_action_without_regeneration(plan_closed, stop):
+    raw = 'Plan.' + ('</think>' if plan_closed else '') + '<action>Hello'
+    engine = Engine([[output(raw, (1, 151645), stop=stop)]])
+    socket, payload, _, _ = run(engine, in_response_cot=ACTION_CONTRACT)
+    assert_action_stream(socket, payload['params']['response_prefix'] +
+                         'Plan.</think><action>Hello</action>')
+    assert len(engine.calls) == 1
+    assert engine.aborted == []
+    complete = next(data for name, data in socket.events if name == 'generation_complete')
+    assert complete['num_tokens'] == 2
+
+
+def test_literal_tags_are_structural_even_inside_quotes():
+    engine = Engine([[output('Plan "<action>Hello</action>" discarded')]])
+    socket, payload, _, _ = run(engine, in_response_cot=ACTION_CONTRACT)
+    assert_action_stream(socket, payload['params']['response_prefix'] +
+                         'Plan "</think><action>Hello</action>')
+
+
+def test_custom_action_tags_work_after_existing_eos_plan_continuation():
+    contract = dict(ACTION_CONTRACT, action_open_tag='[act]', action_close_tag='[/act]')
+    engine = Engine([[output('Plan.')], [output('[act]Hello[/act]discard', finish=None)]])
+    socket, payload, _, _ = run(engine, in_response_cot=contract)
+    assert_action_stream(socket, payload['params']['response_prefix'] +
+                         'Plan.</think>[act]Hello[/act]')
+    assert engine.aborted == ['request:plan-continuation']
+    assert len(engine.calls) == 2
+
+
+@pytest.mark.parametrize('finish,stop', [('length', None), ('abort', None), ('stop', 'other-stop')])
+def test_non_eos_does_not_synthesize_action_close(finish, stop):
+    engine = Engine([[output('Plan.<action>Hello', finish=finish, stop=stop)]])
+    socket, payload, _, _ = run(engine, in_response_cot=ACTION_CONTRACT)
+    assert_action_stream(socket, payload['params']['response_prefix'] + 'Plan.</think><action>Hello')
+    assert len(engine.calls) == 1
+
+
+def test_disabled_action_contract_keeps_unmodified_engine_output():
+    raw = 'Plan.<action>Hello</action>tail'
+    engine = Engine([[output(raw)]])
+    socket, payload, _, _ = run(engine, in_response_cot=dict(ACTION_CONTRACT, enabled=False))
+    assert_action_stream(socket, payload['params']['response_prefix'] + raw)
+    assert not engine.aborted
+
+
+@pytest.mark.parametrize('fields', [
+    {'action_open_tag': ''}, {'action_close_tag': None},
+    {'action_open_tag': '<think>'}, {'action_close_tag': '<action>'},
+])
+def test_invalid_action_delimiters_rejected_before_engine_call(fields):
+    engine = Engine([])
+    socket, _, _, _ = run(engine, in_response_cot=dict(ACTION_CONTRACT, **fields))
+    assert not engine.calls
+    assert any(name == 'generation_error' for name, _ in socket.events)
+
+
+def test_engine_error_during_action_is_not_repaired_as_eos():
+    engine = Engine([[output('Plan.<action>Partial', finish=None), RuntimeError('engine failed')]])
+    socket, _, _, _ = run(engine, in_response_cot=ACTION_CONTRACT)
+    assert any(name == 'generation_error' for name, _ in socket.events)
+    assert not any(name == 'generation_complete' for name, _ in socket.events)
+    text = ''.join(data['delta'] for name, data in socket.events if name == 'token')
+    assert text.endswith('<action>Partial')
+    assert '</action>' not in text
