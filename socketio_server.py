@@ -677,6 +677,8 @@ def _inline_plan_contract(params):
         raise ValueError('in_response_cot requires a boolean enabled field')
     if not contract['enabled']:
         return None
+    if not isinstance(contract.get('force_response_statement', ''), str):
+        raise ValueError('in_response_cot.force_response_statement must be a string')
     opening, closing = contract.get('open_tag'), contract.get('close_tag')
     if (not isinstance(opening, str) or not opening.strip()
             or not isinstance(closing, str) or not closing.strip()
@@ -720,7 +722,7 @@ def _inline_plan_pending(text, contract):
 
 async def _generate_inline_plan(model, processor, inputs, sampling_params,
                                 request_id, contract, prefix, engine_requests, key,
-                                plan_token_limit=None):
+                                plan_token_limit=None, force_response_statement=''):
     """At most two engine attempts, exposed as one cumulative response stream."""
     import copy
     from types import SimpleNamespace
@@ -781,6 +783,13 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
             if (attempt == 0 and plan_token_limit is not None and not plan_closed
                     and not terminal and not budget_hit):
                 visible_text = _inline_plan_completed_text(generated)
+            if force_response_statement and not plan_closed:
+                # Keep a partial closing delimiter private so recovery can put
+                # the statement before it without retracting streamed text.
+                partial = max((size for size in range(1, len(contract[1]))
+                               if visible_text.endswith(contract[1][:size])), default=0)
+                if partial:
+                    visible_text = visible_text[:-partial]
             yield SimpleNamespace(
                 outputs=[SimpleNamespace(text=visible_text, token_ids=token_ids)],
                 finished=terminal and not recover,
@@ -793,7 +802,9 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
             raise RuntimeError('Inline planning engine attempt ended without a terminal output')
         if not recover:
             return
-        base_text, prior_ids = _close_inline_plan(prefix + generated, contract[1])[len(prefix):], token_ids
+        base_text = _close_inline_plan(
+            prefix + generated, contract[1], force_response_statement)[len(prefix):]
+        prior_ids = token_ids
         # Publish the inserted close before continuing, without a terminal flag.
         yield SimpleNamespace(outputs=[SimpleNamespace(text=base_text, token_ids=prior_ids)],
                               finished=False, injected=True)
@@ -820,9 +831,12 @@ def _inline_plan_text_at_limit(tokenizer, token_ids, limit, full_text, published
     raise RuntimeError('Cannot enforce inline plan token budget without revising streamed text')
 
 
-def _close_inline_plan(text, closing):
+def _close_inline_plan(text, closing, force_response_statement=''):
     partial = max((size for size in range(1, len(closing))
                    if text.endswith(closing[:size])), default=0)
+    if force_response_statement:
+        text = text[:-partial] if partial else text
+        return text + '\n' + force_response_statement + '\n' + closing
     return text + closing[partial:]
 
 
@@ -902,7 +916,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 sio._qwen_engine_requests = {}
             generation = _generate_inline_plan(
                 model, processor, inputs, sampling_params, request_id, plan_contract,
-                response_prefix, sio._qwen_engine_requests, (sid, request_id), plan_token_limit)
+                response_prefix, sio._qwen_engine_requests, (sid, request_id), plan_token_limit,
+                p['in_response_cot'].get('force_response_statement', ''))
         else:
             generation = model.generate(inputs, sampling_params, request_id)
         async for output in generation:
