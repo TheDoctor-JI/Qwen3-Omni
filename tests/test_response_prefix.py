@@ -17,7 +17,7 @@ def server(monkeypatch):
     node = next(n for n in ast.parse(SERVER.read_text()).body
                 if isinstance(n, ast.FunctionDef) and n.name == '_prepare_inputs')
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(SERVER), 'exec'), ns)
-    ns.update(_MODEL_IS_INSTRUCT=True, _MAX_NEW_MM_PER_REQUEST=1000,
+    ns.update(_MODEL_PROFILE='instruct', _MAX_NEW_MM_PER_REQUEST=1000,
               _build_messages=lambda payload: ([{'role': 'user', 'content': 'Hello'}], []),
               _process_mm_info_cached=lambda *args: (None, None, None, 0, []))
     monkeypatch.setitem(sys.modules, 'vllm', SimpleNamespace(SamplingParams=lambda **kw: kw))
@@ -63,7 +63,7 @@ def test_invalid_request_reports_normal_generation_error(server, options, error)
 
 def test_thinking_checkpoint_cannot_use_prefix_even_when_thinking_disabled(server):
     ns, processor = server
-    ns['_MODEL_IS_INSTRUCT'] = False
+    ns['_MODEL_PROFILE'] = 'thinking'
     socket = Socket()
     asyncio.run(ns['_stream_generate'](socket, 'sid', None, processor, payload()))
     assert socket.events[0][0] == 'generation_error'

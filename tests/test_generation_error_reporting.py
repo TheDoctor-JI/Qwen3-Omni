@@ -17,12 +17,13 @@ SERVER = Path(__file__).resolve().parents[1] / 'socketio_server.py'
 def load_server_functions():
     tree = ast.parse(SERVER.read_text())
     names = {'MmItemCache', '_process_mm_info_cached', '_response_prefix', '_stream_generate',
-             '_inline_plan_contract', '_inline_plan_pending', '_normalize_inline_action', '_generate_inline_plan'}
+             '_inline_plan_contract', '_inline_plan_pending', '_generate_inline_plan',
+             '_detect_checkpoint_profile'}
     nodes = [node for node in tree.body
              if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
              and node.name in names]
     namespace = dict(globals(), _logger=logging.getLogger('server-test'),
-                     SERVER_CONFIG={}, _MM_MODALITIES={'audio', 'image', 'video'})
+                     SERVER_CONFIG={}, _MODEL_PROFILE='thinking', _MM_MODALITIES={'audio', 'image', 'video'})
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVER), 'exec'), namespace)
     return namespace
 

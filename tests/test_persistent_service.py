@@ -159,7 +159,7 @@ def test_preparation_exceptions_delete_created_files(tmp_path, failure, monkeypa
         media.write_bytes(b'audio')
         return str(media)
     ns['_save_temp_b64'] = save
-    ns['_MODEL_IS_INSTRUCT'] = False
+    ns['_MODEL_PROFILE'] = 'thinking'
     def encode(*args):
         raise ValueError('bad encoding')
     ns['_process_mm_info_cached'] = encode

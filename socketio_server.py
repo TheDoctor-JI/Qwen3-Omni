@@ -27,17 +27,16 @@ Socket.IO protocol
     "stop"      { request_id? }  — cancel the running generation
 
   params.response_prefix is an optional assistant prefill string, echoed once
-  in streamed/terminal text. Nonempty prefixes require an Instruct checkpoint
-  and thinking_mode=False, without thinking_prefix or prime_thinking. Checkpoint
-  detection relies on "instruct" in the loaded checkpoint path (case-insensitive);
-  local directory aliases must retain that marker. Prefixes do not count toward
-  model-generated tokens. The server assigns no semantics to the prefix.
+  in streamed/terminal text. Nonempty prefixes require thinking_mode=False,
+  without thinking_prefix or prime_thinking. Instruct supports generic prefills;
+  Thinking supports prefills only with a valid enabled in_response_cot contract.
+  Checkpoint paths must identify exactly one profile, "instruct" or "thinking"
+  (case-insensitive); local aliases must retain an unambiguous marker. Prefixes
+  do not count toward model-generated tokens.
 
   params.in_response_cot optionally enables one EOS repair/continuation for a
   leading plan: {enabled:true, open_tag:"<plan>", close_tag:"</plan>"}.
-  Optional action_open_tag/action_close_tag add structural action boundaries:
-  an early action closes the plan, a closed action ends output, and normal EOS
-  closes an open action. Tags are structural even inside quoted text.
+  Output after the planning close is passed through until engine completion.
   Without explicit opt-in, generation behaviour is unchanged.
 
   Server → Client events:
@@ -110,7 +109,7 @@ DEFAULT_CKPT_PATH = "./Qwen3-Omni-30B-A3B-Thinking"
 _MAX_NEW_MM_PER_REQUEST: int = 20
 
 # Set during _load_model_processor; used to gate thinking-mode behavior.
-_MODEL_IS_INSTRUCT: bool = False
+_MODEL_PROFILE: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +211,24 @@ def _tool_responses_as_system(template):
     return before + branch + tool_branch.replace(old, new, 1)
 
 
+def _detect_checkpoint_profile(checkpoint_path):
+    path = str(checkpoint_path).lower()
+    matches = [profile for profile in ('instruct', 'thinking') if profile in path]
+    if len(matches) != 1:
+        raise ValueError(
+            f'Checkpoint path must identify exactly one supported profile '
+            f'(instruct or thinking); got {checkpoint_path!r}. '
+            'Local checkpoint aliases must retain an unambiguous profile marker.')
+    return matches[0]
+
+
 def _load_model_processor(args):
     global SERVER_CONFIG
     config = _load_config(getattr(args, 'config', None))
     SERVER_CONFIG = config
 
-    global _MODEL_IS_INSTRUCT
-    ckpt_lower = str(args.checkpoint_path).lower()
-    _MODEL_IS_INSTRUCT = 'instruct' in ckpt_lower
+    global _MODEL_PROFILE
+    _MODEL_PROFILE = _detect_checkpoint_profile(args.checkpoint_path)
 
     model_cfg = config.get('model', {})
     max_num_seqs = int(model_cfg.get('max_num_seqs', 2))
@@ -257,7 +266,7 @@ def _load_model_processor(args):
         f"enable_prefix_caching={enable_prefix_cache}, max_new_mm_per_request={max_new_mm}"
     )
     _logger.info(
-        f"Model profile detected: {'instruct' if _MODEL_IS_INSTRUCT else 'thinking/other'} "
+        f"Model profile detected: {_MODEL_PROFILE} "
         f"(checkpoint={args.checkpoint_path})"
     )
     model = AsyncLLMEngine.from_engine_args(engine_args)
@@ -521,13 +530,15 @@ def _process_mm_info_cached(
 # ---------------------------------------------------------------------------
 
 def _response_prefix(params):
-    """Resolve a generic assistant prefill; checkpoint names identify Instruct."""
+    """Validate prefills against the explicit profile and per-request plan contract."""
+    plan_contract = _inline_plan_contract(params)
     prefix = params.get('response_prefix', '')
     if not isinstance(prefix, str):
         raise ValueError('response_prefix must be a string')
     if prefix:
-        if not _MODEL_IS_INSTRUCT:
-            raise ValueError('response_prefix requires an Instruct checkpoint (path must contain instruct)')
+        if not (_MODEL_PROFILE == 'instruct'
+                or (_MODEL_PROFILE == 'thinking' and plan_contract is not None)):
+            raise ValueError('response_prefix requires an Instruct checkpoint or a Thinking checkpoint with enabled in_response_cot')
         if (params.get('thinking_mode', True) or params.get('prime_thinking', False)
                 or params.get('thinking_prefix', '')):
             raise ValueError('response_prefix requires native thinking and priming disabled')
@@ -587,9 +598,13 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
                 f"Consider reducing context window size."
             )
 
-        # Match the official Instruct recipe: omit enable_thinking so its template
-        # does not insert an empty native <think> block before the assistant output.
-        template_options = {} if _MODEL_IS_INSTRUCT else {'enable_thinking': thinking_mode}
+        # The validated inline prefill supplies the only opening plan block.
+        # Omitting the flag skips the Thinking template's explicit-false empty
+        # block, without changing native-thinking options on other requests.
+        inline_plan = _inline_plan_contract(p)
+        omit_thinking_flag = (_MODEL_PROFILE == 'instruct'
+                              or (_MODEL_PROFILE == 'thinking' and inline_plan is not None))
+        template_options = {} if omit_thinking_flag else {'enable_thinking': thinking_mode}
         prompt_text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, **template_options,
         )
@@ -670,19 +685,11 @@ def _inline_plan_contract(params):
         raise ValueError('in_response_cot requires a prefill starting with its opening tag')
     if not _inline_plan_pending(prefix, (opening, closing)):
         raise ValueError('in_response_cot prefill must leave the planning block open')
-    action_open, action_close = contract.get('action_open_tag'), contract.get('action_close_tag')
-    if action_open is None and action_close is None:
-        return opening, closing
-    tags = (opening, closing, action_open, action_close)
-    if any(not isinstance(tag, str) or not tag.strip() for tag in tags):
-        raise ValueError('Invalid in_response_cot action delimiters')
-    if any(a in b or b in a for i, a in enumerate(tags) for b in tags[i + 1:]):
-        raise ValueError('Overlapping in_response_cot delimiters')
-    return tags
+    return opening, closing
 
 
 def _inline_plan_pending(text, contract):
-    opening, closing = contract[:2]
+    opening, closing = contract
     if not text.startswith(opening):
         raise ValueError('Missing leading inline planning block')
     body = text[len(opening):]
@@ -690,33 +697,6 @@ def _inline_plan_pending(text, contract):
     if nested >= 0 and (end < 0 or nested < end):
         raise ValueError('Nested inline planning block')
     return end < 0
-
-
-def _normalize_inline_action(text, contract, *, final=False, normal_eos=False):
-    """Structural boundary repair before any corresponding bytes reach the client."""
-    if len(contract) == 2:
-        return text, False
-    opening, closing, action_open, action_close = contract
-    start = text.find(action_open, len(opening))
-    if start >= 0:
-        end_plan = text.find(closing, len(opening))
-        if end_plan < 0 or start < end_plan:
-            text = text[:start] + closing + text[start:]
-            start += len(closing)
-        end_action = text.find(action_close, start + len(action_open))
-        if end_action >= 0:
-            return text[:end_action + len(action_close)], True
-        if final and normal_eos:
-            return text + action_close, True
-        pending_tag = action_close
-    else:
-        pending_tag = action_open
-    if not final:
-        hold = max((size for size in range(1, len(pending_tag))
-                    if text.endswith(pending_tag[:size])), default=0)
-        if hold:
-            text = text[:-hold]
-    return text, False
 
 
 async def _generate_inline_plan(model, processor, inputs, sampling_params,
@@ -746,17 +726,7 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
             eos_ids = set(eos if isinstance(eos, (list, tuple, set)) else [eos]) - {None}
             normal_eos = (getattr(item, 'finish_reason', None) == 'stop'
                           and (reason is None or reason == '<|im_end|>' or reason in eos_ids))
-            normalized, action_done = _normalize_inline_action(
-                prefix + generated, contract, final=terminal, normal_eos=normal_eos)
-            if action_done:
-                if not terminal:
-                    await model.abort(engine_id)
-                yield SimpleNamespace(
-                    outputs=[SimpleNamespace(text=normalized[len(prefix):], token_ids=token_ids)],
-                    finished=True,
-                )
-                return
-            if terminal and _inline_plan_pending(normalized, contract):
+            if terminal and _inline_plan_pending(prefix + generated, contract):
                 # vLLM reports ordinary EOS as finish_reason='stop', stop_reason=None;
                 # explicit stop strings/tokens carry their reason. Never repair length.
                 if attempt or not normal_eos or len(token_ids) >= budget:
@@ -765,7 +735,7 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
                 _logger.info('[%s] Repairing unclosed inline plan at EOS: finish=%r stop=%r tokens=%s; injecting %r',
                              request_id, item.finish_reason, reason, len(token_ids), contract[1])
             yield SimpleNamespace(
-                outputs=[SimpleNamespace(text=normalized[len(prefix):], token_ids=token_ids)],
+                outputs=[SimpleNamespace(text=generated, token_ids=token_ids)],
                 finished=terminal and not recover,
             )
         if not saw_output or not terminal:
