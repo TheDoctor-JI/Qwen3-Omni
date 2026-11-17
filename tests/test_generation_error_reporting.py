@@ -9,6 +9,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
+import pytest
 
 
 SERVER = Path(__file__).resolve().parents[1] / 'socketio_server.py'
@@ -70,6 +71,26 @@ def test_preparation_failure_reports_error():
     socket = Socket()
     asyncio.run(ns['_stream_generate'](socket, 'sid', Model(), None, {'request_id': 'request'}))
     assert socket.events == [('generation_error', {'request_id': 'request', 'error': 'invalid audio'})]
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+def test_partial_output_and_token_ids_logged_on_unsuccessful_stream(caplog, cancelled):
+    ns = load_server_functions()
+    ns['_prepare_inputs'] = lambda *args: ({}, None, [], [])
+    partial = 'Tool output\n</tool_call>'
+    class PartialModel:
+        async def generate(self, *args):
+            yield SimpleNamespace(outputs=[SimpleNamespace(text=partial, token_ids=(11, 12))], finished=False)
+            if cancelled:
+                raise asyncio.CancelledError()
+            raise RuntimeError('engine failure')
+    caplog.set_level(logging.DEBUG, logger='server-test')
+    socket = Socket()
+    asyncio.run(ns['_stream_generate'](socket, 'sid', PartialModel(), None, {'request_id': 'partial-request'}))
+    assert repr(partial) in caplog.text
+    assert '[partial-request]' in caplog.text
+    assert f'Generated token IDs at {"cancellation" if cancelled else "failure"}: (11, 12)' in caplog.text
+    assert socket.events[-1][0] == ('generation_stopped' if cancelled else 'generation_error')
 
 
 def test_success_preserves_cache_ack_order_and_cleanup(tmp_path):

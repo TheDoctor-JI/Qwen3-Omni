@@ -1017,6 +1017,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
 
     except asyncio.CancelledError:
         cancelled = True
+        _logger.debug('[%s] Cancelled generation partial text: %r', request_id, prev_text)
+        _logger.debug('[%s] Generated token IDs at cancellation: %s', request_id, last_token_ids)
         _logger.info(f"[{request_id}] Generation cancelled (stopped by client)")
         total_time = time.perf_counter() - t_start
         tps = n_tokens / total_time if total_time > 0 else 0.0
@@ -1034,6 +1036,8 @@ async def _stream_generate(sio, sid, model, processor, payload,
         }, to=sid)
 
     except Exception as exc:
+        _logger.debug('[%s] Failed generation partial text: %r', request_id, prev_text)
+        _logger.debug('[%s] Generated token IDs at failure: %s', request_id, last_token_ids)
         _logger.error(f"[{request_id}] Generation error: {exc}", exc_info=True)
         await sio.emit("generation_error", {
             "request_id": request_id,
