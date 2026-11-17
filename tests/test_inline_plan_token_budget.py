@@ -54,14 +54,14 @@ def complete_text(socket):
 @pytest.mark.parametrize('profile', ['instruct', 'thinking'])
 def test_exact_budget_aborts_engine_and_reserves_response_budget(opening, closing, profile):
     engine, socket, payload, inputs, params = run_budget(
-        [[piece('Pl'), piece('Plan'), RuntimeError('Do not consume after the cap')],
+        [[piece('P.'), piece('P. x'), RuntimeError('Do not consume after the cap')],
          [piece('Hello', 'stop')]], opening=opening, closing=closing, profile=profile)
     text, metrics = complete_text(socket)
-    assert text == payload['params']['response_prefix'] + 'Plan' + closing + 'Hello'
+    assert text == payload['params']['response_prefix'] + 'P.' + closing + 'Hello'
     assert engine.aborted == ['request']
     assert len(engine.calls) == 2
     continuation, remaining, rid = engine.calls[1]
-    assert continuation['prompt'] == inputs['prompt'] + 'Plan' + closing
+    assert continuation['prompt'] == inputs['prompt'] + 'P.' + closing
     assert continuation['multi_modal_data'] is inputs['multi_modal_data']
     assert continuation['mm_processor_kwargs'] is inputs['mm_processor_kwargs']
     assert rid == 'request:plan-continuation'
@@ -73,16 +73,93 @@ def test_exact_budget_aborts_engine_and_reserves_response_budget(opening, closin
 
 @pytest.mark.parametrize('finish', [None, 'stop'])
 def test_batched_tokens_after_cap_are_not_published(finish):
-    first = 'Plan too long</think>discarded response'
+    first = 'P. too long</think>discarded response'
     engine, socket, payload, _, _ = run_budget(
-        [[piece('Pl'), piece(first, finish)], [piece('Actual response', 'stop')]])
+        [[piece('P.'), piece(first, finish)], [piece('Actual response', 'stop')]])
     text, metrics = complete_text(socket)
-    assert text == payload['params']['response_prefix'] + 'Plan</think>Actual response'
+    assert text == payload['params']['response_prefix'] + 'P.</think>Actual response'
     assert 'too long' not in text and 'discarded response' not in text
     assert engine.aborted == (['request'] if finish is None else [])
     # Account for generated but discarded tokens in the shared total budget.
     assert engine.calls[1][1].max_tokens == 256 - len(first)
     assert metrics['generated_tokens'] == len(first) + len('Actual response')
+
+
+@pytest.mark.parametrize('first,retained', [
+    ('First sentence. unfinished', 'First sentence.'),
+    ('An answer! unfinished', 'An answer!'),
+    ('A question? unfinished', 'A question?'),
+    ('完成。未完成', '完成。'),
+    ('完成！未完成', '完成！'),
+    ('完成？未完成', '完成？'),
+    ('First. 再諗！Last? unfinished', 'First. 再諗！Last?'),
+    ('No complete sentence', ''),
+    ('Only a comma, or colon: fragment', ''),
+    ('Complete.  \n', 'Complete.'),
+])
+def test_cap_sanitizes_stream_and_continuation_to_last_sentence(first, retained):
+    # Character-by-character updates expose any premature streaming of the tail.
+    chunks = [piece(first[:end]) for end in range(1, len(first) + 1)]
+    engine, socket, payload, inputs, _ = run_budget(
+        [chunks, [piece('Hello', 'stop')]], limit=len(first))
+    expected_plan = payload['params']['response_prefix'] + retained
+    assert complete_text(socket)[0] == expected_plan + '</think>Hello'
+    assert engine.calls[1][0]['prompt'] == inputs['prompt'] + retained + '</think>'
+    for name, data in socket.events:
+        if name == 'token' and '</think>' not in data['full_text']:
+            assert expected_plan.startswith(data['full_text'])
+    assert engine.calls[1][1].max_tokens == 256 - len(first)
+
+
+@pytest.mark.parametrize('finish', [None, 'length', 'stop'])
+def test_cap_without_sentence_ending_preserves_prefill_and_drops_generated_fragment(finish):
+    engine, socket, payload, inputs, _ = run_budget(
+        [[piece('Pl'), piece('Plan', finish)], [piece('Hello', 'stop')]])
+    assert complete_text(socket)[0] == payload['params']['response_prefix'] + '</think>Hello'
+    assert engine.calls[1][0]['prompt'] == inputs['prompt'] + '</think>'
+
+
+def test_natural_close_flushes_buffered_fragment_unchanged():
+    raw = 'Complete. unfinished but valid</think>Hello'
+    engine, socket, payload, _, _ = run_budget(
+        [[piece('Complete. unfinished'), piece(raw, 'stop')]], limit=len(raw) + 1)
+    assert complete_text(socket)[0] == payload['params']['response_prefix'] + raw
+    first_token = next(data for name, data in socket.events if name == 'token')
+    assert first_token['full_text'] == payload['params']['response_prefix'] + 'Complete.'
+    assert len(engine.calls) == 1 and not engine.aborted
+
+
+def test_eos_before_cap_flushes_buffered_fragment_without_sanitization():
+    raw = 'Complete. unfinished'
+    engine, socket, payload, inputs, _ = run_budget(
+        [[piece(raw[:-1]), piece(raw, 'stop')], [piece('Hello', 'stop')]], limit=len(raw) + 1)
+    assert complete_text(socket)[0] == payload['params']['response_prefix'] + raw + '</think>Hello'
+    assert engine.calls[1][0]['prompt'] == inputs['prompt'] + raw + '</think>'
+
+
+def test_buffering_keeps_engine_first_token_time_and_actual_token_metrics():
+    ns, payload, processor, _, _ = budget_setup(limit=10)
+    clock = [0.0]
+    ns['time'] = SimpleNamespace(perf_counter=lambda: clock[0])
+    class TimedEngine(Engine):
+        async def generate(self, inputs, params, rid):
+            self.calls.append((inputs, params, rid))
+            if len(self.calls) == 1:
+                clock[0] = 1.0
+                yield piece('Un')
+                clock[0] = 5.0
+                yield piece('Unfinished')
+            else:
+                clock[0] = 8.0
+                yield piece('Hello', 'stop')
+    engine, socket = TimedEngine([]), Socket()
+    asyncio.run(ns['_stream_generate'](socket, 'sid', engine, processor, payload))
+    text, metrics = complete_text(socket)
+    assert text == payload['params']['response_prefix'] + '</think>Hello'
+    assert metrics['ttft'] == 1.0
+    assert metrics['generated_tokens'] == 15
+    assert metrics['total_time'] == 8.0
+    assert metrics['tokens_per_second'] == round(15 / 8, 1)
 
 
 def test_natural_close_disables_cap_for_later_response_tokens():
@@ -102,11 +179,11 @@ def test_natural_close_before_cap_in_a_large_batch_needs_no_recovery():
 
 @pytest.mark.parametrize('finish', [None, 'stop'])
 def test_partial_closing_tag_completed_once(finish):
-    first = 'Plan</thi'
+    first = 'Plan.</thi'
     engine, socket, payload, inputs, _ = run_budget(
         [[piece(first, finish)], [piece('Hello', 'stop')]], limit=len(first) if finish is None else 32)
-    assert complete_text(socket)[0] == payload['params']['response_prefix'] + 'Plan</think>Hello'
-    assert engine.calls[1][0]['prompt'] == inputs['prompt'] + 'Plan</think>'
+    assert complete_text(socket)[0] == payload['params']['response_prefix'] + 'Plan.</think>Hello'
+    assert engine.calls[1][0]['prompt'] == inputs['prompt'] + 'Plan.</think>'
 
 
 def test_eos_before_cap_uses_same_single_continuation_allowance():
@@ -165,7 +242,7 @@ def test_client_cancellation_is_not_budget_recovery(when, event):
             async def generate(self, inputs, params, rid):
                 self.calls.append((inputs, params, rid))
                 if len(self.calls) == 1:
-                    yield piece('Plan')
+                    yield piece('P. x')
                     raise AssertionError('First attempt should end at cap')
                 entered.set()
                 await asyncio.Event().wait()
@@ -175,7 +252,7 @@ def test_client_cancellation_is_not_budget_recovery(when, event):
                 emit_original = socket.emit
                 async def emit(name, data, **kwargs):
                     await emit_original(name, data, **kwargs)
-                    suffix = '</think>' if when == 'after_close' else 'Plan'
+                    suffix = '</think>' if when == 'after_close' else 'P.'
                     if name == 'token' and data['full_text'].endswith(suffix):
                         entered.set()
                         await asyncio.Event().wait()
@@ -234,7 +311,9 @@ def test_budget_repaired_stream_executes_actual_client_tool_without_reason_leak(
     from AudioLLMInterface.Shared_Components.AudioLLMGenerationTrajectory import GenerationTerminationState
     action = ('set_language(lang="mandarin")' if python_style else
               '{"name":"set_language","arguments":{"lang":"mandarin"}}')
-    _, socket, _, _, _ = run_budget([[piece('Plan')], [piece(action, 'stop')]])
+    first = 'Plan. unfinished'
+    _, socket, _, _, _ = run_budget([[piece('Plan. un'), piece(first)], [piece(action, 'stop')]],
+                                   limit=len(first))
     client, result = client_setup(tmp_path, tools=True)
     result.gen_config.plan_history_template = 'Latest: {plan}'
     client.mm_config['in_response_cot'] = {'open_tag': '<think>', 'close_tag': '</think>'}
@@ -250,5 +329,5 @@ def test_budget_repaired_stream_executes_actual_client_tool_without_reason_leak(
     client._text_and_audio_generation_thread(result)
     assert result.termination_state == GenerationTerminationState.COMPLETED
     assert len(result.tool_calls) == 1 and result.tool_calls[0].tool_name == 'set_language'
-    assert result.in_response_reason == 'Let me see. Plan'
-    assert [item.text for item in client.context_items if item.is_plan] == ['Latest: Let me see. Plan']
+    assert result.in_response_reason == 'Let me see. Plan.'
+    assert [item.text for item in client.context_items if item.is_plan] == ['Latest: Let me see. Plan.']

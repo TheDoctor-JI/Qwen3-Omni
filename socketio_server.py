@@ -37,7 +37,9 @@ Socket.IO protocol
   params.in_response_cot optionally enables one EOS repair/continuation for a
   leading plan: {enabled:true, open_tag:"<plan>", close_tag:"</plan>"}.
   Its optional max_tokens field caps generated planning tokens; reaching that
-  cap closes the plan and uses the same one-time response continuation.
+  cap trims the unfinished sentence, closes the plan, and uses the same one-time
+  response continuation. Sentence endings are .!?。！？; a fragment without any
+  such ending is dropped. The supplied prefill is preserved.
   Output after the planning close is passed through until engine completion.
   Without explicit opt-in, generation behaviour is unchanged.
 
@@ -756,8 +758,10 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
                         processor.tokenizer, item.token_ids, plan_token_limit,
                         item.text, published_text)
                 if _inline_plan_pending(prefix + at_limit, contract):
-                    generated = at_limit
+                    generated = _inline_plan_completed_text(at_limit)
                     budget_hit = True
+                    _logger.info('[%s] Sanitized capped inline plan: retained=%s discarded=%s chars',
+                                 request_id, len(generated), len(at_limit) - len(generated))
             plan_closed = not _inline_plan_pending(prefix + generated, contract)
             if budget_hit or (terminal and not plan_closed):
                 # vLLM reports ordinary EOS as finish_reason='stop', stop_reason=None;
@@ -770,11 +774,18 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
                 _logger.info('[%s] Closing inline plan for %s: finish=%r stop=%r tokens=%s cap=%s; closing=%r',
                              request_id, 'token budget' if budget_hit else 'normal EOS',
                              getattr(item, 'finish_reason', None), reason, len(token_ids), plan_token_limit, contract[1])
+            # Keep the unfinished sentence private while a capped plan is open.
+            # At the cap it can then be discarded without retracting client text.
+            # Natural closure and ordinary EOS flush the original text unchanged.
+            visible_text = generated
+            if (attempt == 0 and plan_token_limit is not None and not plan_closed
+                    and not terminal and not budget_hit):
+                visible_text = _inline_plan_completed_text(generated)
             yield SimpleNamespace(
-                outputs=[SimpleNamespace(text=generated, token_ids=token_ids)],
+                outputs=[SimpleNamespace(text=visible_text, token_ids=token_ids)],
                 finished=terminal and not recover,
             )
-            published_text = generated
+            published_text = visible_text
             if budget_hit:
                 terminal = True  # This engine attempt was deliberately ended by us.
                 break
@@ -789,6 +800,12 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
         attempt_inputs = dict(inputs, prompt=original_prompt + base_text)
         attempt_params = copy.copy(sampling_params)
         attempt_params.max_tokens = budget - len(prior_ids)
+
+
+def _inline_plan_completed_text(text):
+    """Match experimental thinking sanitation: keep through the last .!?。！？."""
+    last = max((text.rfind(symbol) for symbol in '.!?。！？'), default=-1)
+    return text[:last + 1]
 
 
 def _inline_plan_text_at_limit(tokenizer, token_ids, limit, full_text, published_text):
@@ -897,18 +914,20 @@ async def _stream_generate(sio, sid, model, processor, payload,
             full_text = response_prefix + model_text
             if thinking_mode and prime_thinking:
                 full_text = open_tag + "\n" + full_text
+
+            elapsed = time.perf_counter() - t_start
+            if not getattr(output, 'injected', False) and (last_token_ids or model_text != previous_model_text):
+                # A capped plan may withhold an unfinished sentence, but the
+                # engine has already produced tokens: keep TTFT independent of
+                # when that sentence becomes publishable.
+                if ttft is None:
+                    ttft = elapsed
+                    _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
+                if not last_token_ids and model_text != previous_model_text:
+                    n_tokens += 1
             
             delta = full_text[len(prev_text):]
             if delta:
-                elapsed = time.perf_counter() - t_start
-                if model_text != previous_model_text and not getattr(output, 'injected', False):
-                    if ttft is None:
-                        ttft = elapsed
-                        _logger.debug(f"[{request_id}] First token in {ttft:.3f}s")
-                    # vLLM returns cumulative generated IDs, excluding prefill.
-                    if not last_token_ids:
-                        n_tokens += 1
-
                 # Detect thinking block transitions and log them
                 if not _think_started and open_tag in full_text:
                     _think_started = True
