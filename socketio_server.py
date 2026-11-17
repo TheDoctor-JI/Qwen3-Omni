@@ -36,6 +36,8 @@ Socket.IO protocol
 
   params.in_response_cot optionally enables one EOS repair/continuation for a
   leading plan: {enabled:true, open_tag:"<plan>", close_tag:"</plan>"}.
+  Its optional max_tokens field caps generated planning tokens; reaching that
+  cap closes the plan and uses the same one-time response continuation.
   Output after the planning close is passed through until engine completion.
   Without explicit opt-in, generation behaviour is unchanged.
 
@@ -573,6 +575,7 @@ def _prepare_inputs(processor, payload, session_cache: Optional[MmItemCache] = N
     )
 
     response_prefix = _response_prefix(p)
+    _inline_plan_token_limit(p, max_tokens)
 
     messages, temp_files = _build_messages(payload)
     try:
@@ -685,7 +688,21 @@ def _inline_plan_contract(params):
         raise ValueError('in_response_cot requires a prefill starting with its opening tag')
     if not _inline_plan_pending(prefix, (opening, closing)):
         raise ValueError('in_response_cot prefill must leave the planning block open')
+    _inline_plan_token_limit(params)
     return opening, closing
+
+
+def _inline_plan_token_limit(params, total_budget=None):
+    contract = params.get('in_response_cot')
+    if not isinstance(contract, dict) or contract.get('enabled') is not True:
+        return None
+    limit = contract.get('max_tokens')
+    if limit is not None:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError('in_response_cot.max_tokens must be a positive integer')
+        if total_budget is not None and limit >= total_budget:
+            raise ValueError('in_response_cot.max_tokens must be smaller than the total output budget')
+    return limit
 
 
 def _inline_plan_pending(text, contract):
@@ -700,7 +717,8 @@ def _inline_plan_pending(text, contract):
 
 
 async def _generate_inline_plan(model, processor, inputs, sampling_params,
-                                request_id, contract, prefix, engine_requests, key):
+                                request_id, contract, prefix, engine_requests, key,
+                                plan_token_limit=None):
     """At most two engine attempts, exposed as one cumulative response stream."""
     import copy
     from types import SimpleNamespace
@@ -709,6 +727,8 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
     budget = sampling_params.max_tokens
     base_text, prior_ids = '', ()
     attempt_inputs, attempt_params = inputs, sampling_params
+    published_text = ''
+    plan_closed = False
     for attempt in range(2):
         engine_id = request_id if attempt == 0 else request_id + ':plan-continuation'
         engine_requests[key] = engine_id
@@ -726,29 +746,67 @@ async def _generate_inline_plan(model, processor, inputs, sampling_params,
             eos_ids = set(eos if isinstance(eos, (list, tuple, set)) else [eos]) - {None}
             normal_eos = (getattr(item, 'finish_reason', None) == 'stop'
                           and (reason is None or reason == '<|im_end|>' or reason in eos_ids))
-            if terminal and _inline_plan_pending(prefix + generated, contract):
+            budget_hit = False
+            if (attempt == 0 and not plan_closed and plan_token_limit is not None
+                    and len(item.token_ids) >= plan_token_limit
+                    and (not terminal or normal_eos or getattr(item, 'finish_reason', None) == 'length')):
+                at_limit = item.text
+                if len(item.token_ids) > plan_token_limit:
+                    at_limit = _inline_plan_text_at_limit(
+                        processor.tokenizer, item.token_ids, plan_token_limit,
+                        item.text, published_text)
+                if _inline_plan_pending(prefix + at_limit, contract):
+                    generated = at_limit
+                    budget_hit = True
+            plan_closed = not _inline_plan_pending(prefix + generated, contract)
+            if budget_hit or (terminal and not plan_closed):
                 # vLLM reports ordinary EOS as finish_reason='stop', stop_reason=None;
                 # explicit stop strings/tokens carry their reason. Never repair length.
-                if attempt or not normal_eos or len(token_ids) >= budget:
+                if budget_hit and not terminal:
+                    await model.abort(engine_id)
+                if attempt or (not budget_hit and not normal_eos) or len(token_ids) >= budget:
                     raise RuntimeError('Inline plan ended unclosed without an eligible EOS continuation')
                 recover = True
-                _logger.info('[%s] Repairing unclosed inline plan at EOS: finish=%r stop=%r tokens=%s; injecting %r',
-                             request_id, item.finish_reason, reason, len(token_ids), contract[1])
+                _logger.info('[%s] Closing inline plan for %s: finish=%r stop=%r tokens=%s cap=%s; closing=%r',
+                             request_id, 'token budget' if budget_hit else 'normal EOS',
+                             getattr(item, 'finish_reason', None), reason, len(token_ids), plan_token_limit, contract[1])
             yield SimpleNamespace(
                 outputs=[SimpleNamespace(text=generated, token_ids=token_ids)],
                 finished=terminal and not recover,
             )
+            published_text = generated
+            if budget_hit:
+                terminal = True  # This engine attempt was deliberately ended by us.
+                break
         if not saw_output or not terminal:
             raise RuntimeError('Inline planning engine attempt ended without a terminal output')
         if not recover:
             return
-        base_text, prior_ids = generated + contract[1], token_ids
+        base_text, prior_ids = _close_inline_plan(prefix + generated, contract[1])[len(prefix):], token_ids
         # Publish the inserted close before continuing, without a terminal flag.
         yield SimpleNamespace(outputs=[SimpleNamespace(text=base_text, token_ids=prior_ids)],
                               finished=False, injected=True)
         attempt_inputs = dict(inputs, prompt=original_prompt + base_text)
         attempt_params = copy.copy(sampling_params)
         attempt_params.max_tokens = budget - len(prior_ids)
+
+
+def _inline_plan_text_at_limit(tokenizer, token_ids, limit, full_text, published_text):
+    """Decode an unexposed token prefix without revising text already streamed."""
+    for end in range(limit, -1, -1):
+        text = tokenizer.decode(token_ids[:end], skip_special_tokens=True,
+                                clean_up_tokenization_spaces=False)
+        # A token boundary can fall inside a multibyte character. Back up to
+        # the nearest complete prefix instead of emitting replacement text.
+        if full_text.startswith(text) and text.startswith(published_text):
+            return text
+    raise RuntimeError('Cannot enforce inline plan token budget without revising streamed text')
+
+
+def _close_inline_plan(text, closing):
+    partial = max((size for size in range(1, len(closing))
+                   if text.endswith(closing[:size])), default=0)
+    return text + closing[partial:]
 
 
 async def _stream_generate(sio, sid, model, processor, payload,
@@ -810,6 +868,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 preparation_done(preparation)
             raise
 
+        plan_token_limit = _inline_plan_token_limit(p, sampling_params.max_tokens) if plan_contract else None
         # Notify client which items are confirmed in the encoding cache.
         # Emitted before generation_start so the client has acks before tokens.
         if confirmed_items:
@@ -826,7 +885,7 @@ async def _stream_generate(sio, sid, model, processor, payload,
                 sio._qwen_engine_requests = {}
             generation = _generate_inline_plan(
                 model, processor, inputs, sampling_params, request_id, plan_contract,
-                response_prefix, sio._qwen_engine_requests, (sid, request_id))
+                response_prefix, sio._qwen_engine_requests, (sid, request_id), plan_token_limit)
         else:
             generation = model.generate(inputs, sampling_params, request_id)
         async for output in generation:

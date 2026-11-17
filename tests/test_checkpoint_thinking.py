@@ -99,10 +99,13 @@ def inline_request(opening='<think>', closing='</think>', seed=''):
 @pytest.mark.parametrize('profile', ['thinking', 'instruct'])
 @pytest.mark.parametrize('opening,closing', [('<think>', '</think>'), ('<plan>', '</plan>'), ('[reason]', '[/reason]')])
 @pytest.mark.parametrize('seed', ['', 'Let me see. '])
-def test_inline_prompt_has_exact_single_prefill(checkpoint_server, profile, opening, closing, seed):
+@pytest.mark.parametrize('limit', [None, 128])
+def test_inline_prompt_has_exact_single_prefill(checkpoint_server, profile, opening, closing, seed, limit):
     ns, processor, _, options = checkpoint_server
     ns['_MODEL_PROFILE'] = profile
     request = inline_request(opening, closing, seed)
+    if limit is not None:
+        request['params']['in_response_cot']['max_tokens'] = limit
     inputs, _, _, _ = ns['_prepare_inputs'](processor, request)
     suffix = inputs['prompt'].rsplit('<|im_start|>assistant\n', 1)[1]
     assert suffix == opening + seed

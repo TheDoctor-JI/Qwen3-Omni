@@ -18,7 +18,8 @@ def load_server_functions():
     tree = ast.parse(SERVER.read_text())
     names = {'MmItemCache', '_process_mm_info_cached', '_response_prefix', '_stream_generate',
              '_inline_plan_contract', '_inline_plan_pending', '_generate_inline_plan',
-             '_detect_checkpoint_profile'}
+             '_detect_checkpoint_profile', '_inline_plan_token_limit',
+             '_inline_plan_text_at_limit', '_close_inline_plan'}
     nodes = [node for node in tree.body
              if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
              and node.name in names]
