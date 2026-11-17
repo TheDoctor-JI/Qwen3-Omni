@@ -305,12 +305,13 @@ def test_cancellation_during_internal_engine_abort_never_closes_or_restarts_plan
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('python_style', [False, True])
-def test_budget_repaired_stream_executes_actual_client_tool_without_reason_leak(tmp_path, python_style):
+@pytest.mark.parametrize('tagged', [False, True])
+def test_budget_repaired_stream_executes_actual_client_tool_without_reason_leak(tmp_path, tagged):
     from AudioLLMInterface.tests.test_mm_in_response_cot import setup as client_setup
     from AudioLLMInterface.Shared_Components.AudioLLMGenerationTrajectory import GenerationTerminationState
-    action = ('set_language(lang="mandarin")' if python_style else
-              '{"name":"set_language","arguments":{"lang":"mandarin"}}')
+    action = '{"name":"set_language","arguments":{"lang":"mandarin"}}'
+    if tagged:
+        action = '<tool_call>' + action + '</tool_call>'
     first = 'Plan. unfinished'
     _, socket, _, _, _ = run_budget([[piece('Plan. un'), piece(first)], [piece(action, 'stop')]],
                                    limit=len(first))

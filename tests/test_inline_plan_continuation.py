@@ -222,7 +222,7 @@ def test_temp_files_cleaned_once_after_both_attempts(tmp_path):
 @pytest.mark.parametrize('repair_eos', [False, True])
 @pytest.mark.parametrize('action', [
     '{"name":"set_language","arguments":{"lang":"mandarin"}}',
-    'set_language(lang="mandarin")',
+    '<tool_call>{"name":"set_language","arguments":{"lang":"mandarin"}}</tool_call>',
 ])
 def test_direct_stream_completes_actual_mm_tool_pipeline(tmp_path, opening, closing, repair_eos, action):
     from AudioLLMInterface.tests.test_mm_in_response_cot import setup as client_setup
